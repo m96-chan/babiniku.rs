@@ -9,7 +9,9 @@
 //! tracked in issue #4.
 
 mod ecapa;
+mod fast_u2pp;
 mod vocos;
 
 pub use ecapa::{Ecapa, EcapaConfig};
+pub use fast_u2pp::{FastU2pp, FastU2ppConfig};
 pub use vocos::{Vocos, VocosConfig};
