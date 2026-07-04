@@ -2,8 +2,8 @@
 //! with FRC masks) and the UTTE (cross-attention over universal timbre
 //! tokens).
 
-use candle_core::Tensor;
-use candle_nn::{linear, ops::softmax_last_dim, Linear, Module, VarBuilder};
+use candle_core::{Tensor, D};
+use candle_nn::{linear, ops::softmax, Linear, Module, VarBuilder};
 
 /// Multi-head attention with separate query and key/value inputs.
 ///
@@ -78,7 +78,11 @@ impl MultiHeadAttention {
         if let Some(mask) = mask {
             logits = logits.broadcast_add(mask)?;
         }
-        let weights = softmax_last_dim(&logits)?;
+        // `ops::softmax` (composed of basic ops) rather than the fused
+        // `softmax_last_dim`: the latter is registered with no backward op,
+        // which would silently sever both gradients and forward-mode
+        // tangents through the attention weights.
+        let weights = softmax(&logits, D::Minus1)?;
         let out = weights
             .matmul(&v)?
             .transpose(1, 2)?

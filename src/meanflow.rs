@@ -23,15 +23,16 @@
 //! At inference the clean sample is recovered with a **single** function
 //! evaluation: `z_0 = z_1 - f_θ(z_1, 0, 1)` with `z_1 = ε ~ N(0, I)`.
 //!
-//! ### Note on the JVP
+//! ### Computing the JVP
 //!
-//! `candle` has no forward-mode autodiff, so [`mean_flow_loss`] approximates
-//! the JVP with a central-free forward finite difference along the tangent
-//! `(v_t, 0, 1)`. This adds one extra forward pass and a step-size
-//! hyper-parameter (`delta`, default `1e-2`) but keeps the whole objective
-//! expressible in stable candle ops.
+//! The JVP is computed **exactly** with forward-mode AD
+//! ([`candle_core::forward_ad::jvp`], added on the
+//! `feat/forward-ad-jvp` branch of the candle fork), at the cost of
+//! roughly one extra forward pass. A forward finite-difference mode
+//! ([`JvpMode::FiniteDifference`]) is kept for cross-checking and as a
+//! fallback for ops without a forward-AD rule.
 
-use candle_core::Tensor;
+use candle_core::{forward_ad, DType, Tensor, Var};
 
 use crate::model::MeanVc2;
 use crate::Result;
@@ -64,6 +65,18 @@ pub fn sample_rt(
     Ok(RtSample { r, t })
 }
 
+/// How to compute the JVP term of the mean-flows target (Eq. 3).
+#[derive(Debug, Clone, Copy, Default)]
+pub enum JvpMode {
+    /// Exact forward-mode AD (default).
+    #[default]
+    Exact,
+    /// Forward finite differences with the given step size — one extra
+    /// forward pass and O(step) truncation error. Kept for cross-checking
+    /// the exact mode and as a fallback.
+    FiniteDifference(f64),
+}
+
 /// Everything produced by one training step of the mean-flows objective.
 #[derive(Debug)]
 pub struct MeanFlowLoss {
@@ -75,14 +88,9 @@ pub struct MeanFlowLoss {
     pub target: Tensor,
 }
 
-/// Computes the mean-flows training loss (Eq. 4 of the paper).
-///
-/// * `x`: clean mel-spectrogram `[batch, time, n_mels]`
-/// * `cond_bnf`: timbre-aware BNFs `[batch, time, bnf_dim]`
-/// * `speaker`: `[batch, speaker_dim]`
-/// * `masks`: per-layer FRC masks (chunked training, Sec. 3.2) or `None`
-/// * `rt`: interval endpoints from [`sample_rt`]
-/// * `delta`: finite-difference step for the JVP approximation
+/// Computes the mean-flows training loss (Eq. 4 of the paper), sampling the
+/// noise internally. See [`mean_flow_loss_with_noise`] for the full
+/// parameter list.
 pub fn mean_flow_loss(
     model: &MeanVc2,
     x: &Tensor,
@@ -90,26 +98,73 @@ pub fn mean_flow_loss(
     speaker: &Tensor,
     masks: Option<&[Tensor]>,
     rt: &RtSample,
-    delta: f64,
+    mode: JvpMode,
+) -> Result<MeanFlowLoss> {
+    let noise = x.randn_like(0.0, 1.0)?;
+    mean_flow_loss_with_noise(model, x, &noise, cond_bnf, speaker, masks, rt, mode)
+}
+
+/// Computes the mean-flows training loss with caller-provided noise
+/// (useful for reproducibility and for comparing [`JvpMode`]s on identical
+/// inputs).
+///
+/// * `x`: clean mel-spectrogram `[batch, time, n_mels]`
+/// * `noise`: `ε ~ N(0, I)`, same shape as `x`
+/// * `cond_bnf`: timbre-aware BNFs `[batch, time, bnf_dim]`
+/// * `speaker`: `[batch, speaker_dim]`
+/// * `masks`: per-layer FRC masks (chunked training, Sec. 3.2) or `None`
+/// * `rt`: interval endpoints from [`sample_rt`]
+#[allow(clippy::too_many_arguments)]
+pub fn mean_flow_loss_with_noise(
+    model: &MeanVc2,
+    x: &Tensor,
+    noise: &Tensor,
+    cond_bnf: &Tensor,
+    speaker: &Tensor,
+    masks: Option<&[Tensor]>,
+    rt: &RtSample,
+    mode: JvpMode,
 ) -> Result<MeanFlowLoss> {
     let (b, _, _) = x.dims3()?;
-    let noise = x.randn_like(0.0, 1.0)?;
     let t3 = rt.t.reshape((b, 1, 1))?;
 
     // z_t = (1 - t) x + t ε, v_t = ε - x.
     let z_t = x
         .broadcast_mul(&(1.0 - &t3)?)?
         .broadcast_add(&noise.broadcast_mul(&t3)?)?;
-    let v_t = (&noise - x)?;
+    let v_t = (noise - x)?;
 
-    let u = model.forward(&z_t, cond_bnf, speaker, &rt.r, &rt.t, masks)?;
-
-    // JVP along the tangent (dz, dr, dt) = (v_t, 0, 1), forward differences:
-    // (f(z + δ v, r, t + δ) - f(z, r, t)) / δ.
-    let z_shift = (&z_t + &(v_t.clone() * delta)?)?;
-    let t_shift = (&rt.t + delta)?;
-    let u_shift = model.forward(&z_shift, cond_bnf, speaker, &rt.r, &t_shift, masks)?;
-    let jvp = ((&u_shift - &u)? / delta)?;
+    let (u, jvp) = match mode {
+        JvpMode::Exact => {
+            // Seeds must be graph-tracking for tangents to propagate, so the
+            // inputs are wrapped in `Var`s (cheap; see forward_ad docs).
+            let z_var = Var::from_tensor(&z_t)?;
+            let t_var = Var::from_tensor(&rt.t)?;
+            let u = model.forward(
+                z_var.as_tensor(),
+                cond_bnf,
+                speaker,
+                &rt.r,
+                t_var.as_tensor(),
+                masks,
+            )?;
+            let dt = Tensor::ones((b,), DType::F32, x.device())?;
+            let jvp = forward_ad::jvp(
+                &u,
+                &[(z_var.as_tensor(), &v_t), (t_var.as_tensor(), &dt)],
+            )?;
+            (u, jvp)
+        }
+        JvpMode::FiniteDifference(delta) => {
+            // (f(z + δ v, r, t + δ) - f(z, r, t)) / δ along (v_t, 0, 1).
+            let u = model.forward(&z_t, cond_bnf, speaker, &rt.r, &rt.t, masks)?;
+            let z_shift = (&z_t + &(v_t.clone() * delta)?)?;
+            let t_shift = (&rt.t + delta)?;
+            let u_shift = model.forward(&z_shift, cond_bnf, speaker, &rt.r, &t_shift, masks)?;
+            let jvp = ((&u_shift - &u)? / delta)?;
+            (u, jvp)
+        }
+    };
 
     // u_tgt = v_t - (t - r) * jvp, with stop-gradient.
     let span = (&rt.t - &rt.r)?.reshape((b, 1, 1))?;
@@ -138,8 +193,8 @@ pub fn sample_1nfe(
 ) -> Result<Tensor> {
     let b = noise.dim(0)?;
     let device = noise.device();
-    let r = Tensor::zeros((b,), candle_core::DType::F32, device)?;
-    let t = Tensor::ones((b,), candle_core::DType::F32, device)?;
+    let r = Tensor::zeros((b,), DType::F32, device)?;
+    let t = Tensor::ones((b,), DType::F32, device)?;
     let u = model.forward(noise, cond_bnf, speaker, &r, &t, masks)?;
     Ok((noise - &u)?)
 }

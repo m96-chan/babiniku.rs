@@ -11,8 +11,8 @@ keywords = ["voice-conversion", "speech", "streaming", "diffusion", "candle"]
 categories = ["multimedia::audio", "science"]
 
 [dependencies]
-candle-core = { git = "https://github.com/m96-chan/candle", branch = "main" }
-candle-nn = { git = "https://github.com/m96-chan/candle", branch = "main" }
+candle-core = { git = "https://github.com/m96-chan/candle", branch = "feat/forward-ad-jvp" }
+candle-nn = { git = "https://github.com/m96-chan/candle", branch = "feat/forward-ad-jvp" }
 rustfft = "6"
 thiserror = "2"
 

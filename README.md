@@ -52,7 +52,7 @@ Default hyper-parameters follow ยง4.1 of the paper: 4 DiT blocks (hidden 512, 2 
 meanvc2 = { git = "https://github.com/m96-chan/meanvc2.rs" }
 ```
 
-The crate currently builds against the [m96-chan/candle](https://github.com/m96-chan/candle) fork of candle (v0.11).
+The crate currently builds against the [m96-chan/candle](https://github.com/m96-chan/candle) fork of candle (v0.11, `feat/forward-ad-jvp` branch), which adds the forward-mode AD used by the mean-flows objective.
 
 CUDA / Metal acceleration comes from candle's backends:
 
@@ -104,14 +104,16 @@ cargo run --release --example streaming_demo
 ### Training objective
 
 ```rust
-use meanvc2::meanflow::{mean_flow_loss, sample_rt};
+use meanvc2::meanflow::{mean_flow_loss, sample_rt, JvpMode};
 
 let cond = model.timbre_aware_bnf(&bnf, &speaker)?;
 let masks = model.decoder.frc_masks(time, &device)?;   // chunked training
 let rt = sample_rt(batch, 0.75, &device)?;             // r = t 75% of the time
-let out = mean_flow_loss(&model, &mel, &cond, &speaker, Some(&masks), &rt, 1e-2)?;
+let out = mean_flow_loss(&model, &mel, &cond, &speaker, Some(&masks), &rt, JvpMode::Exact)?;
 out.loss.backward()?;
 ```
+
+The JVP inside the mean-flows target is computed **exactly** with forward-mode AD (`candle_core::forward_ad::jvp`, added on the candle fork's `feat/forward-ad-jvp` branch). `JvpMode::FiniteDifference(delta)` is kept for cross-checking.
 
 ## External components
 
@@ -141,7 +143,7 @@ This is an **unofficial, experimental** implementation written from the paper โ€
 
 Known deviations from the paper (details in the module docs):
 
-- candle has no forward-mode autodiff, so the JVP inside the mean-flows target (Eq. 3) is approximated with a forward finite difference (one extra forward pass, step `delta`).
+- The JVP inside the mean-flows target (Eq. 3) is computed exactly with forward-mode AD implemented on the candle fork (`feat/forward-ad-jvp` branch, tracked in [#1](https://github.com/m96-chan/meanvc2.rs/issues/1)); a finite-difference mode remains available for cross-checking.
 - Details the paper leaves unspecified (MLP activations, adaLN layout, mel settings, how the speaker embedding conditions the decoder) follow common DiT/flow-matching practice; the default config counts ~25 M parameters vs. the paper's 18 M.
 
 ## Development
