@@ -8,6 +8,8 @@
 //! upstream PyTorch checkpoints and validating against golden outputs is
 //! tracked in issue #4.
 
+mod ecapa;
 mod vocos;
 
+pub use ecapa::{Ecapa, EcapaConfig};
 pub use vocos::{Vocos, VocosConfig};
