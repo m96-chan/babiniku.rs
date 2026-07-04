@@ -106,7 +106,6 @@ impl ConvNeXtBlock {
 }
 
 /// The Vocos model: ConvNeXt backbone + ISTFT head.
-#[derive(Debug)]
 pub struct Vocos {
     embed: Conv1d,
     norm: LayerNorm,
@@ -115,7 +114,14 @@ pub struct Vocos {
     /// Head projection to `n_fft + 2` channels (magnitude ‖ phase).
     out: Linear,
     window: Vec<f32>,
+    ifft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     cfg: VocosConfig,
+}
+
+impl std::fmt::Debug for Vocos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vocos").field("cfg", &self.cfg).finish()
+    }
 }
 
 impl Vocos {
@@ -140,6 +146,7 @@ impl Vocos {
             })
             .collect();
         Ok(Self {
+            ifft: FftPlanner::new().plan_fft_inverse(cfg.n_fft),
             embed: conv1d(cfg.input_channels, cfg.dim, 7, embed_cfg, bb.pp("embed"))?,
             norm: layer_norm(cfg.dim, LayerNormConfig::default(), bb.pp("norm"))?,
             convnext,
@@ -202,7 +209,6 @@ impl Vocos {
         let mut y = vec![0f32; padded_len];
         let mut wsum = vec![0f32; padded_len];
 
-        let ifft = FftPlanner::new().plan_fft_inverse(n_fft);
         let mut buf = vec![Complex32::default(); n_fft];
         for (frame, (re, im)) in real.iter().zip(imag.iter()).enumerate() {
             // Hermitian-symmetric full spectrum.
@@ -213,7 +219,7 @@ impl Vocos {
                 let src = buf[n_fft - bin];
                 buf[bin] = Complex32::new(src.re, -src.im);
             }
-            ifft.process(&mut buf);
+            self.ifft.process(&mut buf);
             let offset = frame * hop;
             for i in 0..n_fft {
                 let s = buf[i].re / n_fft as f32;

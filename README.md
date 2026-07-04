@@ -117,15 +117,19 @@ The JVP inside the mean-flows target is computed **exactly** with forward-mode A
 
 ## External components
 
-MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs):
+MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs) with pure-candle backends in [`src/backends/`](src/backends/):
 
-| Component | Trait | Used in the paper |
-|---|---|---|
-| Semantic (BNF) extractor | `SemanticEncoder` | [Fast-U2++](https://github.com/wenet-e2e/wenet) (WeNet), 80 ms chunks, 40 ms frames |
-| Speaker encoder | `SpeakerEncoder` | [ECAPA-TDNN](https://github.com/speechbrain/speechbrain), 192-dim |
-| Vocoder | `Vocoder` | [Vocos](https://github.com/gemelo-ai/vocos), 16 kHz |
+| Component | Trait | Backend | Used in the paper |
+|---|---|---|---|
+| Semantic (BNF) extractor | `SemanticEncoder` | `backends::FastU2pp` (WeNet U2++ conformer port) | [Fast-U2++](https://github.com/wenet-e2e/wenet) (WeNet), 80 ms chunks, 40 ms frames |
+| Speaker encoder | `SpeakerEncoder` | `backends::Ecapa` (SpeechBrain-layout port) | [ECAPA-TDNN](https://github.com/speechbrain/speechbrain), 192-dim |
+| Vocoder | `Vocoder` | `backends::Vocos` (ConvNeXt + ISTFT port) | [Vocos](https://github.com/gemelo-ai/vocos), 16 kHz |
 
-Implement these traits against your runtime of choice (ONNX Runtime via [`ort`](https://github.com/pykeio/ort), candle ports, etc.) to assemble the full pipeline.
+Each backend's module tree mirrors its upstream implementation so converted safetensors checkpoints map 1:1 (`FastU2pp::load` / `Ecapa::load` / `Vocos::load`); checkpoint conversion scripts and golden-output validation are tracked in [#4](https://github.com/m96-chan/meanvc2.rs/issues/4). The full wav-to-wav pipeline runs end to end with random weights:
+
+```sh
+cargo run --release --example pipeline_demo
+```
 
 ## Project status
 
@@ -137,9 +141,9 @@ This is an **unofficial, experimental** implementation written from the paper â€
 - [x] Mean-flows loss (Eq. 4) and 1-NFE sampling
 - [x] Streaming converter with bounded look-ahead and cached per-chunk noise
 - [x] Log-mel front-end
+- [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests pending, see [#4](https://github.com/m96-chan/meanvc2.rs/issues/4))
 - [ ] Pretrained weights (blocked on data/training run)
 - [ ] Training loop / recipe (Emilia-style corpus, AdamW, etc.)
-- [ ] Vocos / Fast-U2++ / ECAPA-TDNN inference backends
 
 Known deviations from the paper (details in the module docs):
 
