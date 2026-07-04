@@ -1,0 +1,28 @@
+[package]
+name = "meanvc2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Unofficial Rust implementation of MeanVC 2: robust low-latency streaming zero-shot voice conversion"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/m96-chan/meanvc2.rs"
+readme = "README.md"
+keywords = ["voice-conversion", "speech", "streaming", "diffusion", "candle"]
+categories = ["multimedia::audio", "science"]
+
+[dependencies]
+candle-core = { git = "https://github.com/m96-chan/candle", branch = "main" }
+candle-nn = { git = "https://github.com/m96-chan/candle", branch = "main" }
+rustfft = "6"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,184 @@
+# meanvc2.rs
+
+> Unofficial Rust implementation of **MeanVC 2: Robust Low-Latency Streaming Zero-Shot Voice Conversion** ([arXiv:2606.09050](https://arxiv.org/abs/2606.09050)), built on [candle](https://github.com/huggingface/candle).
+
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Paper](https://img.shields.io/badge/arXiv-2606.09050-b31b1b.svg)](https://arxiv.org/abs/2606.09050)
+[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#project-status)
+
+MeanVC 2 (Ma et al., 2026) is a streaming zero-shot voice conversion system that converts a source speaker's voice into that of an arbitrary unseen target speaker with a **110 ms end-to-end first-packet latency** on a single CPU core. It achieves this by combining:
+
+- **Mean flows** — the decoder regresses the *average* velocity along the ODE trajectory, enabling high-quality mel-spectrogram synthesis with a **single network evaluation (1-NFE)** instead of an iterative diffusion loop.
+- **Future-receptive chunking (FRC)** — a layer-wise attention-mask schedule for the DiT decoder that grants each 40 ms chunk a bounded receptive field (6 past chunks + 1 future chunk with the paper's defaults), stabilizing short-chunk streaming without autoregressive teacher forcing.
+- **Universal timbre token encoder (UTTE)** — instead of extracting timbre from reference mel-spectrograms (which is sensitive to reference audio quality), a set of learnable universal timbre tokens is modulated by a global speaker embedding, and bottleneck features query them via cross-attention to produce *timbre-aware* content features.
+
+This crate implements the trainable core of the paper — UTTE, the FRC-scheduled DiT decoder, the mean-flows objective/sampler, and a chunk-by-chunk streaming driver — in pure Rust.
+
+## Architecture
+
+```text
+ source wav ──► streaming ASR ──► BNFs ─────────────┐
+                (Fast-U2++, external)               ▼
+                                              ┌──────────┐    timbre-aware
+ reference ──► speaker encoder ──► spk emb ──►│   UTTE   │──► BNFs
+    wav        (ECAPA-TDNN, external)    │    └──────────┘      │
+                                         │                      ▼
+                              noise ε ───┼──────────────► ┌────────────┐
+                              (r, t) ────┴───────────────►│ DiT decoder│
+                                                          │ (FRC masks)│
+                                                          └─────┬──────┘
+                                                       1-NFE    ▼
+                                        converted wav ◄── vocoder ◄── mel
+                                                          (Vocos, external)
+```
+
+| Module | Source | Paper section |
+|---|---|---|
+| FRC attention-mask scheduling | [`src/frc.rs`](src/frc.rs) | §3.2 |
+| Universal timbre token encoder | [`src/model/utte.rs`](src/model/utte.rs) | §3.3 |
+| DiT decoder (adaLN-Zero blocks) | [`src/model/dit.rs`](src/model/dit.rs), [`src/model/decoder.rs`](src/model/decoder.rs) | §3.1 |
+| Mean-flows loss & 1-NFE sampling | [`src/meanflow.rs`](src/meanflow.rs) | §2.1–2.2 |
+| Streaming chunk driver | [`src/streaming.rs`](src/streaming.rs) | §3.2 |
+| Log-mel front-end | [`src/audio/mel.rs`](src/audio/mel.rs) | §4.1 |
+| External-model traits | [`src/encoders.rs`](src/encoders.rs) | §3.1 |
+
+Default hyper-parameters follow §4.1 of the paper: 4 DiT blocks (hidden 512, 2 heads), 32 universal timbre tokens (hidden 256, 4-head cross-attention), 40 ms chunks on 16 kHz audio, and FRC receptive fields `P = [2, 2, 1, 1]`, `F = [1, 0, 0, 0]`.
+
+## Installation
+
+```toml
+[dependencies]
+meanvc2 = { git = "https://github.com/m96-chan/meanvc2.rs" }
+```
+
+The crate currently builds against the [m96-chan/candle](https://github.com/m96-chan/candle) fork of candle (v0.11).
+
+CUDA / Metal acceleration comes from candle's backends:
+
+```sh
+cargo build --release --features cuda   # or --features metal
+```
+
+## Quick start
+
+### Offline (full-utterance) conversion
+
+```rust
+use candle_core::{Device, Tensor};
+use meanvc2::{MeanVc2, MeanVc2Config};
+
+let device = Device::Cpu;
+let cfg = MeanVc2Config::default();
+let model = MeanVc2::load(cfg, "meanvc2.safetensors", &device)?;
+
+// BNFs from your streaming ASR (upsampled to the mel frame rate) and a
+// speaker embedding from your speaker encoder — see `meanvc2::encoders`.
+let bnf: Tensor = semantic_encoder.extract(&source_wav, 16_000)?;   // [1, time, bnf_dim]
+let speaker: Tensor = speaker_encoder.embed(&reference_wav, 16_000)?; // [1, speaker_dim]
+
+let mel = model.convert(&bnf, &speaker)?; // [1, time, 80], 1-NFE
+// feed `mel` to a vocoder (e.g. Vocos) to obtain the waveform
+```
+
+### Streaming conversion
+
+```rust
+use meanvc2::StreamingConverter;
+
+let mut converter = StreamingConverter::new(&model, &speaker)?;
+for bnf_chunk in bnf_chunks {           // [1, 4, bnf_dim] per 40 ms chunk
+    for mel_chunk in converter.push(&bnf_chunk)? {
+        vocoder.synthesize(&mel_chunk)?; // emitted with 1 chunk look-ahead
+    }
+}
+converter.finish()?;                     // flush trailing chunks
+```
+
+A runnable end-to-end demo with random weights:
+
+```sh
+cargo run --release --example streaming_demo
+```
+
+### Training objective
+
+```rust
+use meanvc2::meanflow::{mean_flow_loss, sample_rt};
+
+let cond = model.timbre_aware_bnf(&bnf, &speaker)?;
+let masks = model.decoder.frc_masks(time, &device)?;   // chunked training
+let rt = sample_rt(batch, 0.75, &device)?;             // r = t 75% of the time
+let out = mean_flow_loss(&model, &mel, &cond, &speaker, Some(&masks), &rt, 1e-2)?;
+out.loss.backward()?;
+```
+
+## External components
+
+MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs):
+
+| Component | Trait | Used in the paper |
+|---|---|---|
+| Semantic (BNF) extractor | `SemanticEncoder` | [Fast-U2++](https://github.com/wenet-e2e/wenet) (WeNet), 80 ms chunks, 40 ms frames |
+| Speaker encoder | `SpeakerEncoder` | [ECAPA-TDNN](https://github.com/speechbrain/speechbrain), 192-dim |
+| Vocoder | `Vocoder` | [Vocos](https://github.com/gemelo-ai/vocos), 16 kHz |
+
+Implement these traits against your runtime of choice (ONNX Runtime via [`ort`](https://github.com/pykeio/ort), candle ports, etc.) to assemble the full pipeline.
+
+## Project status
+
+This is an **unofficial, experimental** implementation written from the paper — the official source code and weights had not been released at the time of writing (the authors state they will release both; audio samples are [here](https://aslp-lab.github.io/MeanVC2/)).
+
+- [x] FRC layer-wise attention masks (§3.2)
+- [x] UTTE with learnable tanh-fused priors (§3.3)
+- [x] DiT decoder with adaLN-Zero and dual-timestep `(r, t)` conditioning
+- [x] Mean-flows loss (Eq. 4) and 1-NFE sampling
+- [x] Streaming converter with bounded look-ahead and cached per-chunk noise
+- [x] Log-mel front-end
+- [ ] Pretrained weights (blocked on data/training run)
+- [ ] Training loop / recipe (Emilia-style corpus, AdamW, etc.)
+- [ ] Vocos / Fast-U2++ / ECAPA-TDNN inference backends
+
+Known deviations from the paper (details in the module docs):
+
+- candle has no forward-mode autodiff, so the JVP inside the mean-flows target (Eq. 3) is approximated with a forward finite difference (one extra forward pass, step `delta`).
+- Details the paper leaves unspecified (MLP activations, adaLN layout, mel settings, how the speaker embedding conditions the decoder) follow common DiT/flow-matching practice; the default config counts ~25 M parameters vs. the paper's 18 M.
+
+## Development
+
+```sh
+cargo test          # unit + integration tests (shapes, masks, streaming)
+cargo clippy --all-targets
+cargo run --release --example streaming_demo
+```
+
+## Citation
+
+If you use this code, please cite the original paper:
+
+```bibtex
+@article{ma2026meanvc2,
+  title   = {MeanVC 2: Robust Low-Latency Streaming Zero-Shot Voice Conversion},
+  author  = {Ma, Guobin and Xia, Yuxuan and Jiang, Yuepeng and Guo, Dake and
+             Xie, Hanke and Hu, Jingbin and Wang, Yanbo and Xie, Lei and Zhu, Pengcheng},
+  journal = {arXiv preprint arXiv:2606.09050},
+  year    = {2026}
+}
+```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+## Acknowledgements
+
+- [MeanVC 2](https://arxiv.org/abs/2606.09050) by the ASLP@NPU group — all model ideas belong to the original authors.
+- [candle](https://github.com/huggingface/candle) — the ML framework this crate is built on (via the [m96-chan/candle](https://github.com/m96-chan/candle) fork).
+- [MeanFlow](https://arxiv.org/abs/2505.13447) (Geng et al., 2025) — the one-step generative modeling formulation.
