@@ -18,6 +18,7 @@ thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
+hound = "3"
 
 [features]
 default = []

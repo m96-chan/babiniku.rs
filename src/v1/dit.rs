@@ -2,10 +2,30 @@
 //! rms-qk-norm attention, and the adaLN-Zero chunk block — matching the
 //! official `modules.py` parameter tree.
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{linear, Linear, Module, VarBuilder};
 
 use super::MeanVc1Config;
+
+/// LayerNorm without learnable parameters
+/// (`nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NonAffineLayerNorm {
+    eps: f64,
+}
+
+impl NonAffineLayerNorm {
+    pub(crate) fn new(eps: f64) -> Self {
+        Self { eps }
+    }
+
+    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let mean = x.mean_keepdim(D::Minus1)?;
+        let x = x.broadcast_sub(&mean)?;
+        let var = x.sqr()?.mean_keepdim(D::Minus1)?;
+        x.broadcast_div(&(var + self.eps)?.sqrt()?)
+    }
+}
 
 /// Sinusoidal timestep embedding + 2-layer MLP (`time_mlp.{0,2}`).
 ///
@@ -146,12 +166,19 @@ impl ChunkAttention {
         })
     }
 
-    fn forward(
+    /// Streaming attention with the official KV-cache semantics: `kv` holds
+    /// qk-normalized, **pre-RoPE** key/value tensors of older tokens; keys
+    /// are re-rotated each call with absolute positions covering the whole
+    /// key timeline (`rope` must span `kv_len + t` positions). Returns the
+    /// new cache: everything except the trailing `keep_out` tokens.
+    #[allow(clippy::type_complexity)]
+    fn forward_kv(
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
         rope: &(Tensor, Tensor),
-    ) -> candle_core::Result<Tensor> {
+        kv: Option<(&(Tensor, Tensor), usize)>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (b, t, _) = x.dims3()?;
         let split = |x: Tensor| -> candle_core::Result<Tensor> {
             x.reshape((b, t, self.heads, self.head_dim))?
@@ -159,9 +186,29 @@ impl ChunkAttention {
                 .contiguous()
         };
         let q = self.q_norm.forward(&split(self.to_q.forward(x)?)?)?;
-        let k = self.k_norm.forward(&split(self.to_k.forward(x)?)?)?;
-        let v = split(self.to_v.forward(x)?)?;
-        let q = self.rotary.apply(&q, rope)?;
+        let mut k = self.k_norm.forward(&split(self.to_k.forward(x)?)?)?;
+        let mut v = split(self.to_v.forward(x)?)?;
+        let mut new_kv = None;
+        if let Some(((k_cache, v_cache), keep_out)) = kv {
+            if k_cache.dim(2)? > 0 {
+                k = Tensor::cat(&[k_cache, &k], 2)?;
+                v = Tensor::cat(&[v_cache, &v], 2)?;
+            }
+            let key_len = k.dim(2)?;
+            if key_len > keep_out {
+                new_kv = Some((
+                    k.narrow(2, 0, key_len - keep_out)?,
+                    v.narrow(2, 0, key_len - keep_out)?,
+                ));
+            }
+        }
+        // Rotate the full key timeline; the query uses the trailing freqs.
+        let key_len = k.dim(2)?;
+        let q_rope = (
+            rope.0.narrow(0, key_len - t, t)?,
+            rope.1.narrow(0, key_len - t, t)?,
+        );
+        let q = self.rotary.apply(&q, &q_rope)?;
         let k = self.rotary.apply(&k, rope)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
@@ -174,7 +221,7 @@ impl ChunkAttention {
             .matmul(&v)?
             .transpose(1, 2)?
             .reshape((b, t, self.heads * self.head_dim))?;
-        self.to_out.forward(&out)
+        Ok((self.to_out.forward(&out)?, new_kv))
     }
 }
 
@@ -182,25 +229,20 @@ impl ChunkAttention {
 #[derive(Debug)]
 pub struct ChunkDiTBlock {
     ada_ln: Linear,
-    attn_norm: LayerNorm,
+    attn_norm: NonAffineLayerNorm,
     attn: ChunkAttention,
-    ff_norm: LayerNorm,
+    ff_norm: NonAffineLayerNorm,
     ff_in: Linear,
     ff_out: Linear,
 }
 
 impl ChunkDiTBlock {
     pub fn new(cfg: &MeanVc1Config, vb: VarBuilder) -> candle_core::Result<Self> {
-        let ln = LayerNormConfig {
-            affine: false,
-            eps: 1e-6,
-            ..Default::default()
-        };
         Ok(Self {
             ada_ln: linear(cfg.dim, cfg.dim * 6, vb.pp("attn_norm.linear"))?,
-            attn_norm: layer_norm(cfg.dim, ln, vb.pp("attn_norm.norm"))?,
+            attn_norm: NonAffineLayerNorm::new(1e-6),
             attn: ChunkAttention::new(cfg, vb.pp("attn"))?,
-            ff_norm: layer_norm(cfg.dim, ln, vb.pp("ff_norm"))?,
+            ff_norm: NonAffineLayerNorm::new(1e-6),
             ff_in: linear(cfg.dim, cfg.dim * cfg.ff_mult, vb.pp("ff.ff.0.0"))?,
             ff_out: linear(cfg.dim * cfg.ff_mult, cfg.dim, vb.pp("ff.ff.2"))?,
         })
@@ -215,6 +257,20 @@ impl ChunkDiTBlock {
         mask: Option<&Tensor>,
         rope: &(Tensor, Tensor),
     ) -> candle_core::Result<Tensor> {
+        Ok(self.forward_kv(x, time, mask, rope, None)?.0)
+    }
+
+    /// Streaming block forward with per-block KV cache (see
+    /// `ChunkAttention::forward_kv`).
+    #[allow(clippy::type_complexity)]
+    pub fn forward_kv(
+        &self,
+        x: &Tensor,
+        time: &Tensor,
+        mask: Option<&Tensor>,
+        rope: &(Tensor, Tensor),
+        kv: Option<(&(Tensor, Tensor), usize)>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let params = self.ada_ln.forward(&time.silu()?)?;
         let c = params.chunk(6, 1)?;
         let (shift_msa, scale_msa, gate_msa) = (&c[0], &c[1], &c[2]);
@@ -225,12 +281,15 @@ impl ChunkDiTBlock {
                 .broadcast_add(&shift.unsqueeze(1)?)
         };
         let h = modulate(&self.attn_norm.forward(x)?, shift_msa, scale_msa)?;
-        let h = self.attn.forward(&h, mask, rope)?;
+        let (h, new_kv) = self.attn.forward_kv(&h, mask, rope, kv)?;
         let x = x.broadcast_add(&h.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
 
         let h = modulate(&self.ff_norm.forward(&x)?, shift_mlp, scale_mlp)?;
         // GELU (tanh approximation), as in the official FeedForward.
         let h = self.ff_out.forward(&self.ff_in.forward(&h)?.gelu()?)?;
-        x.broadcast_add(&h.broadcast_mul(&gate_mlp.unsqueeze(1)?)?)
+        Ok((
+            x.broadcast_add(&h.broadcast_mul(&gate_mlp.unsqueeze(1)?)?)?,
+            new_kv,
+        ))
     }
 }

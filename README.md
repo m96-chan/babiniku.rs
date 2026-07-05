@@ -147,7 +147,7 @@ This is an **unofficial, experimental** implementation written from the paper â€
 - [x] Log-mel front-end
 - [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests in [#8](https://github.com/m96-chan/meanvc2.rs/issues/8))
 - [x] MeanVC v1 model (`meanvc2::v1`): MRTE, CARD, RoPE + rms-qk-norm ChunkDiT â€” official parameter tree, 14.1M params vs the paper's 14M ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
-- [ ] MeanVC v1 official-weight conversion + golden parity, wav-to-wav example ([#12](https://github.com/m96-chan/meanvc2.rs/issues/12))
+- [x] MeanVC v1 official weights load + real wav-to-wav example (`cargo run --release --example convert_v1`; perceptual quality pending the Python A/B check in [#14](https://github.com/m96-chan/meanvc2.rs/issues/14))
 - [ ] MeanVC 2 pretrained weights (official release pending; training loop [#3](https://github.com/m96-chan/meanvc2.rs/issues/3) as fallback)
 
 Known deviations from the paper (details in the module docs):

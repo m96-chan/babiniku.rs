@@ -121,7 +121,9 @@ impl MelSpectrogram {
             let start = frame * cfg.hop_length;
             buf.fill(Complex32::default());
             for (i, &w) in self.window.iter().enumerate() {
-                let s = padded.get(start + i).copied().unwrap_or(0.0);
+                // torch.stft convention: the win_length window is centered
+                // in the n_fft frame, and the signal segment shifts with it.
+                let s = padded.get(start + win_offset + i).copied().unwrap_or(0.0);
                 buf[win_offset + i] = Complex32::new(s * w, 0.0);
             }
             self.fft.process(&mut buf);
