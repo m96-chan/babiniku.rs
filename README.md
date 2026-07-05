@@ -130,6 +130,14 @@ cargo run --release --features demo --bin meanvc-demo -- \
 
 TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
 
+## Performance notes
+
+candle's CPU matmuls run on a rayon pool that defaults to **all logical cores**; on SMT (hyper-threaded) machines the resulting contention makes the small per-chunk workloads ~3–10× slower. Set `RAYON_NUM_THREADS` to the number of **physical** cores for the best CPU latency — measured on an 8c/16t machine ([#19](https://github.com/m96-chan/meanvc2.rs/issues/19)): demo vocoder chunk RTF 0.57 → 0.06, offline `convert_v1` end-to-end 456 ms → 226 ms.
+
+- `meanvc-demo` and the `convert_v1` example pin the pool to physical cores automatically when `RAYON_NUM_THREADS` is unset.
+- The other offline examples, and the library itself, use candle's default; set the variable yourself, e.g. `RAYON_NUM_THREADS=8 cargo run --release --example streaming_demo`.
+- When embedding the crate, set `RAYON_NUM_THREADS` (or configure the global rayon pool) before the first tensor op — the pool size is fixed at first use.
+
 ## External components
 
 MeanVC 2 trains only the UTTE and the DiT decoder. The three frozen components are pretrained external models, abstracted as traits in [`src/encoders.rs`](src/encoders.rs) with pure-candle backends in [`src/backends/`](src/backends/):
