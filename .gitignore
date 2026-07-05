@@ -2,3 +2,5 @@
 Cargo.lock
 *.safetensors
 *.wav
+# committed golden fixtures (small, deterministic)
+!tools/fixtures/*.safetensors
