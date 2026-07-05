@@ -1,0 +1,7 @@
+torch>=2.1
+safetensors>=0.4
+# per-component extras for the parity sweep (issue #8):
+# torchaudio  (mel fixture)
+# vocos       (Vocos golden outputs)
+# speechbrain (ECAPA golden outputs)
+# wenet / torch checkpoints only (Fast-U2++ conversion uses raw state_dict)
