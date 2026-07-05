@@ -56,6 +56,12 @@ pub struct MelSpectrogram {
     filterbank: Vec<Vec<f32>>,
 }
 
+impl std::fmt::Debug for MelSpectrogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MelSpectrogram").field("cfg", &self.cfg).finish()
+    }
+}
+
 impl MelSpectrogram {
     pub fn new(cfg: MelConfig) -> Self {
         let fft = FftPlanner::new().plan_fft_forward(cfg.n_fft);
