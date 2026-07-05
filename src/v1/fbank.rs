@@ -152,8 +152,8 @@ pub fn interpolate_linear(x: &Tensor, factor: usize) -> Result<Tensor> {
             let i0 = src.floor() as usize;
             let i1 = (i0 + 1).min(t - 1);
             let w = src - i0 as f32;
-            for k in 0..d {
-                out.push(batch[i0][k] * (1.0 - w) + batch[i1][k] * w);
+            for (a, b) in batch[i0].iter().zip(&batch[i1]) {
+                out.push(a * (1.0 - w) + b * w);
             }
         }
     }
