@@ -10,12 +10,14 @@
 //!     --reference ckpt/test.wav --voice-print ckpt/voice_print_test.safetensors
 //! ```
 //!
-//! Keys: `q` quit · `p` passthrough (bypass conversion for A/B).
+//! Keys: `q` quit · `p` passthrough (bypass conversion for A/B) ·
+//! `l` loopback monitor (hear the converted voice on the default output).
 //!
 //! Options: `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
 //! additionally records the converted audio, `--no-sink` skips creating
-//! the virtual device, `--duration <secs>` auto-stops (for testing).
+//! the virtual device, `--monitor` starts with the loopback enabled,
+//! `--duration <secs>` auto-stops (for testing).
 //!
 //! Approximations vs the offline path (tracked in #9): BNFs come from a
 //! rolling 1.6 s analysis window instead of full incremental caches, and
@@ -64,6 +66,7 @@ struct Args {
     out: Option<String>,
     headless: bool,
     no_sink: bool,
+    monitor: bool,
     duration: Option<f32>,
 }
 
@@ -75,6 +78,7 @@ fn parse_args() -> Args {
         out: None,
         headless: false,
         no_sink: false,
+        monitor: false,
         duration: None,
     };
     let mut it = std::env::args().skip(1);
@@ -86,6 +90,7 @@ fn parse_args() -> Args {
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
             "--no-sink" => a.no_sink = true,
+            "--monitor" => a.monitor = true,
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -119,6 +124,46 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
         "source_properties=device.description=MeanVC-Virtual-Mic",
     ])?;
     Ok(vec![sink, mic])
+}
+
+/// Loopback monitor: routes the converted audio to the default output so
+/// the user can hear it. Returns the pactl module id.
+struct Monitor(Mutex<Option<String>>);
+
+impl Monitor {
+    fn toggle(&self) -> anyhow::Result<bool> {
+        let mut slot = self.0.lock().unwrap();
+        match slot.take() {
+            Some(id) => {
+                let _ = Command::new("pactl").args(["unload-module", &id]).status();
+                Ok(false)
+            }
+            None => {
+                let out = Command::new("pactl")
+                    .args([
+                        "load-module",
+                        "module-loopback",
+                        &format!("source={SINK}.monitor"),
+                        "latency_msec=60",
+                    ])
+                    .output()?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "pactl module-loopback failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                *slot = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+                Ok(true)
+            }
+        }
+    }
+
+    fn off(&self) {
+        let mut slot = self.0.lock().unwrap();
+        if let Some(id) = slot.take() {
+            let _ = Command::new("pactl").args(["unload-module", &id]).status();
+        }
+    }
 }
 
 fn destroy_virtual_device(modules: &[String]) {
@@ -179,6 +224,10 @@ fn main() -> anyhow::Result<()> {
         create_virtual_device()?
     };
     let sink_ok = !modules.is_empty();
+    let monitor = Arc::new(Monitor(Mutex::new(None)));
+    if args.monitor && sink_ok {
+        monitor.toggle()?;
+    }
 
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
@@ -416,7 +465,7 @@ fn main() -> anyhow::Result<()> {
         }
         eprintln!();
     } else {
-        run_tui(stats.clone(), run.clone(), args.duration)?;
+        run_tui(stats.clone(), run.clone(), monitor.clone(), sink_ok, args.duration)?;
     }
 
     run.store(false, Ordering::Relaxed);
@@ -425,6 +474,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("thread error: {e}");
         }
     }
+    monitor.off();
     destroy_virtual_device(&modules);
     eprintln!("virtual device removed, bye");
     Ok(())
@@ -433,6 +483,8 @@ fn main() -> anyhow::Result<()> {
 fn run_tui(
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
+    monitor: Arc<Monitor>,
+    sink_ok: bool,
     duration: Option<f32>,
 ) -> anyhow::Result<()> {
     use crossterm::event::{self, Event, KeyCode};
@@ -441,6 +493,10 @@ fn run_tui(
 
     let mut terminal = ratatui::init();
     let started = Instant::now();
+    let mut monitoring = {
+        let m = monitor.0.lock().unwrap();
+        m.is_some()
+    };
     while run.load(Ordering::Relaxed) {
         if let Some(d) = duration {
             if started.elapsed().as_secs_f32() >= d {
@@ -508,7 +564,11 @@ fn run_tui(
                 rows[3],
             );
             f.render_widget(
-                Paragraph::new(format!("{}\n[q] quit   [p] toggle passthrough", snapshot.8))
+                Paragraph::new(format!(
+                    "{}\n[q] quit   [p] passthrough   [l] loopback monitor: {}",
+                    snapshot.8,
+                    if monitoring { "ON (hearing converted voice)" } else { "off" }
+                ))
                     .block(Block::default().borders(Borders::ALL).title(" MeanVC virtual mic ")),
                 rows[4],
             );
@@ -520,6 +580,9 @@ fn run_tui(
                     KeyCode::Char('p') => {
                         let mut st = stats.lock().unwrap();
                         st.passthrough = !st.passthrough;
+                    }
+                    KeyCode::Char('l') if sink_ok => {
+                        monitoring = monitor.toggle().unwrap_or(monitoring);
                     }
                     _ => {}
                 }

@@ -128,7 +128,7 @@ cargo run --release --features demo --bin meanvc-demo -- \
     --reference target_voice.wav --voice-print voice_print.safetensors
 ```
 
-TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B) / `q` (quit; removes the virtual device). `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
+TUI shows level meters, per-stage RTF, and supports `p` (passthrough A/B), `l` (loopback monitor — hear the converted voice on your speakers), `q` (quit; removes the virtual device). `--monitor` starts with the loopback on. `--wav file.wav` streams a file instead of the mic, `--headless` / `--out out.wav` / `--duration N` support scripted runs. Requires the checkpoints under `ckpt/` (see `examples/convert_v1.rs`) and `pactl`. Measured on a single CPU: VC stage RTF ≈ 0.57 and vocoder RTF ≈ 0.57 running pipelined — sustained real time with ~0.6 s latency.
 
 ## External components
 
