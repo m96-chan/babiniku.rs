@@ -17,10 +17,12 @@
 
 mod card;
 mod dit;
+mod fbank;
 mod mel;
 mod mrte;
 
 pub use card::card_mask;
+pub use fbank::{interpolate_linear, KaldiFbank};
 pub use mel::MelV1;
 pub use dit::{ChunkDiTBlock, RotaryEmbedding, TimestepEmbedding};
 use dit::NonAffineLayerNorm;
@@ -226,8 +228,12 @@ impl MeanVc1 {
                 let cache_len = cache_mel.dim(1)?;
                 let c = self.cache_embed.forward(cache_mel)?;
                 h = Tensor::cat(&[c, h], 1)?;
-                // Cache occupies positions 0.., x continues at pos_offset.
+                // Official rope convention: every cached chunk is embedded
+                // at positions 0..chunk_size (rope_cache is rebuilt per
+                // chunk), while the noisy input continues at pos_offset.
+                let cs = self.cfg.chunk_size;
                 let pos: Vec<usize> = (0..cache_len)
+                    .map(|i| i % cs)
                     .chain(pos_offset..pos_offset + seq_len)
                     .collect();
                 self.rotary.freqs(&pos, device)?
