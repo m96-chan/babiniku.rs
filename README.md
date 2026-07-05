@@ -1,6 +1,6 @@
 # meanvc2.rs
 
-> Unofficial Rust implementation of **MeanVC 2: Robust Low-Latency Streaming Zero-Shot Voice Conversion** ([arXiv:2606.09050](https://arxiv.org/abs/2606.09050)), built on [candle](https://github.com/huggingface/candle).
+> Unofficial Rust implementation of the **MeanVC family** of streaming zero-shot voice conversion systems — **MeanVC** ([arXiv:2510.08392](https://arxiv.org/abs/2510.08392)) and **MeanVC 2** ([arXiv:2606.09050](https://arxiv.org/abs/2606.09050)) — built on [candle](https://github.com/huggingface/candle).
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -13,7 +13,11 @@ MeanVC 2 (Ma et al., 2026) is a streaming zero-shot voice conversion system that
 - **Future-receptive chunking (FRC)** — a layer-wise attention-mask schedule for the DiT decoder that grants each 40 ms chunk a bounded receptive field (6 past chunks + 1 future chunk with the paper's defaults), stabilizing short-chunk streaming without autoregressive teacher forcing.
 - **Universal timbre token encoder (UTTE)** — instead of extracting timbre from reference mel-spectrograms (which is sensitive to reference audio quality), a set of learnable universal timbre tokens is modulated by a global speaker embedding, and bottleneck features query them via cross-attention to produce *timbre-aware* content features.
 
-This crate implements the trainable core of the paper — UTTE, the FRC-scheduled DiT decoder, the mean-flows objective/sampler, and a chunk-by-chunk streaming driver — in pure Rust.
+This crate implements the trainable core of MeanVC 2 — UTTE, the FRC-scheduled DiT decoder, the mean-flows objective/sampler, and a chunk-by-chunk streaming driver — in pure Rust, plus candle ports of the frozen external models.
+
+## MeanVC (v1) support
+
+The original **MeanVC** (Ma et al., 2025) shares the recognition–synthesis skeleton and the mean-flows decoder, but uses **chunk-wise autoregressive denoising (CARD)** instead of FRC and a reference-mel **MRTE timbre encoder** instead of UTTE. Unlike MeanVC 2, its [official implementation and pretrained checkpoints are public](https://github.com/ASLP-lab/MeanVC) (VC model, Fast-U2++, and a 16 kHz Vocos on [Hugging Face](https://huggingface.co/ASLP-lab/MeanVC)) — so this repo targets a **weight-compatible v1 port** as the fastest path to real conversion, while the v2 implementation stands ready for the official v2 release. Progress is tracked in the v1 port issue.
 
 ## Architecture
 
@@ -141,9 +145,9 @@ This is an **unofficial, experimental** implementation written from the paper �
 - [x] Mean-flows loss (Eq. 4) and 1-NFE sampling
 - [x] Streaming converter with bounded look-ahead and cached per-chunk noise
 - [x] Log-mel front-end
-- [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests pending, see [#4](https://github.com/m96-chan/meanvc2.rs/issues/4))
-- [ ] Pretrained weights (blocked on data/training run)
-- [ ] Training loop / recipe (Emilia-style corpus, AdamW, etc.)
+- [x] Vocos / Fast-U2++ / ECAPA-TDNN inference backends (candle ports; checkpoint conversion + golden tests in [#8](https://github.com/m96-chan/meanvc2.rs/issues/8))
+- [ ] MeanVC v1 port, weight-compatible with the [official checkpoints](https://huggingface.co/ASLP-lab/MeanVC) (CARD, MRTE, RoPE DiT)
+- [ ] MeanVC 2 pretrained weights (official release pending; training loop [#3](https://github.com/m96-chan/meanvc2.rs/issues/3) as fallback)
 
 Known deviations from the paper (details in the module docs):
 
