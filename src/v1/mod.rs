@@ -252,6 +252,79 @@ impl MeanVc1 {
         Ok(self.proj_out.forward(&h)?)
     }
 
+    /// One streaming CARD step with the official KV-cache semantics
+    /// (`dit_kvcache.py`): `x` is the current noisy chunk, `cache_mel` the
+    /// previously generated clean chunk, `offset` the absolute frame
+    /// position of `x`, and `kv` the running per-block cache (older
+    /// clean-chunk keys/values, re-rotated each call at absolute
+    /// positions, capped at `max_lookback` chunks).
+    pub fn forward_stream(
+        &self,
+        x: &Tensor,
+        timbre_cond: &Tensor,
+        spks: &Tensor,
+        cache_mel: Option<&Tensor>,
+        offset: usize,
+        kv: &mut KvCache,
+    ) -> Result<Tensor> {
+        let (b, seq_len, _) = x.dims3()?;
+        let cs = self.cfg.chunk_size;
+        let device = x.device();
+        let time = (self.t_time_embed.forward(&Tensor::ones((b,), DType::F32, device)?)?
+            + self.r_time_embed.forward(&Tensor::zeros((b,), DType::F32, device)?)?)?;
+
+        let spks_rep = spks.unsqueeze(1)?.expand((b, seq_len, self.cfg.bn_dim))?;
+        let mut h = self
+            .input_proj
+            .forward(&Tensor::cat(&[x, timbre_cond, &spks_rep], 2)?)?;
+        if let Some(cache_mel) = cache_mel {
+            h = Tensor::cat(&[self.cache_embed.forward(cache_mel)?, h], 1)?;
+        }
+        let q_len = h.dim(1)?;
+        if kv.per_block.is_empty() {
+            kv.per_block = vec![None; self.blocks.len()];
+        }
+        let kv_len = kv.len();
+        let key_len = kv_len + q_len;
+        // Absolute positions over the key timeline: the last key is at
+        // offset + cs - 1 (mirrors rope[..., -140:, :] in the official code).
+        let pos_start = (offset + cs).saturating_sub(key_len);
+        let pos: Vec<usize> = (pos_start..offset + cs).collect();
+        let rope = self.rotary.freqs(&pos, device)?;
+        let mask = stream_mask(key_len, q_len, cs, self.cfg.max_lookback, device)?;
+        let max_kv = self.cfg.max_lookback * cs;
+
+        let empty = (
+            Tensor::zeros((b, self.cfg.heads, 0, self.cfg.head_dim), DType::F32, device)?,
+            Tensor::zeros((b, self.cfg.heads, 0, self.cfg.head_dim), DType::F32, device)?,
+        );
+        for (block, slot) in self.blocks.iter().zip(kv.per_block.iter_mut()) {
+            let (out, new_kv) = block.forward_kv(
+                &h,
+                &time,
+                Some(&mask),
+                &rope,
+                Some((slot.as_ref().unwrap_or(&empty), cs)),
+            )?;
+            h = out;
+            // Cap the cache to the attention window.
+            *slot = match new_kv {
+                Some((k, v)) => {
+                    let l = k.dims()[2];
+                    if l > max_kv {
+                        Some((k.narrow(2, l - max_kv, max_kv)?, v.narrow(2, l - max_kv, max_kv)?))
+                    } else {
+                        Some((k, v))
+                    }
+                }
+                None => None,
+            };
+        }
+        let h = h.narrow(1, q_len - seq_len, seq_len)?;
+        let h = self.norm_out.forward(&h, &time)?;
+        Ok(self.proj_out.forward(&h)?)
+    }
+
     /// Offline chunk-wise autoregressive 1-NFE conversion (CARD inference).
     ///
     /// Generates chunk by chunk; each chunk is denoised in a single step
@@ -267,31 +340,57 @@ impl MeanVc1 {
         }
         let device = cond.device();
         let timbre = self.timbre_cond(cond, prompts, spks)?;
-        let r = Tensor::zeros((b,), DType::F32, device)?;
-        let t = Tensor::ones((b,), DType::F32, device)?;
 
+        let mut kv = KvCache::default();
         let mut chunks: Vec<Tensor> = Vec::with_capacity(n / cs);
         for q in 0..n / cs {
             let noise = Tensor::randn(0f32, 1f32, (b, cs, self.cfg.n_mels), device)?;
             let cond_q = timbre.narrow(1, q * cs, cs)?;
-            let start = q.saturating_sub(self.cfg.max_lookback);
-            let cache = if q > 0 {
-                Some(Tensor::cat(&chunks[start..q], 1)?)
-            } else {
-                None
-            };
-            let layout = match &cache {
-                Some(c) => CacheLayout::Streaming {
-                    cache: c,
-                    pos_offset: q * cs,
-                },
-                None => CacheLayout::None,
-            };
-            let u = self.forward(&noise, &cond_q, spks, layout, &r, &t)?;
+            let cache = chunks.last().cloned();
+            let u = self.forward_stream(&noise, &cond_q, spks, cache.as_ref(), q * cs, &mut kv)?;
             chunks.push((noise - u)?);
         }
         Ok(Tensor::cat(&chunks, 1)?)
     }
+}
+
+/// Per-block KV cache for streaming CARD inference (qk-normalized,
+/// pre-RoPE key/value tensors, official `dit_kvcache.py` semantics).
+#[derive(Debug, Default)]
+pub struct KvCache {
+    per_block: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl KvCache {
+    fn len(&self) -> usize {
+        self.per_block
+            .first()
+            .and_then(|kv| kv.as_ref())
+            .map(|(k, _)| k.dims()[2])
+            .unwrap_or(0)
+    }
+}
+
+/// Additive sliding-window inference mask (`0 <= cj - ci <= lookback` over
+/// chunk indices of the key timeline), rows sliced to the query tokens.
+fn stream_mask(
+    key_len: usize,
+    q_len: usize,
+    chunk_size: usize,
+    lookback: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let mut data = vec![-1e9f32; q_len * key_len];
+    for row in 0..q_len {
+        let cj = (key_len - q_len + row) / chunk_size;
+        for col in 0..key_len {
+            let ci = col / chunk_size;
+            if cj >= ci && cj - ci <= lookback {
+                data[row * key_len + col] = 0.0;
+            }
+        }
+    }
+    Tensor::from_vec(data, (q_len, key_len), device)
 }
 
 /// Additive CARD mask over the `[cache ‖ noisy]` training layout.

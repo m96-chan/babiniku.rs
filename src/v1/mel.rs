@@ -130,7 +130,9 @@ impl MelV1 {
             let start = frame * HOP_LENGTH;
             buf.fill(Complex32::default());
             for (i, &w) in self.window.iter().enumerate() {
-                let s = padded.get(start + i).copied().unwrap_or(0.0);
+                // torch.stft places the zero-padded window at the center of
+                // the n_fft frame, so the signal segment is offset too.
+                let s = padded.get(start + win_offset + i).copied().unwrap_or(0.0);
                 buf[win_offset + i] = Complex32::new(s * w, 0.0);
             }
             self.fft.process(&mut buf);

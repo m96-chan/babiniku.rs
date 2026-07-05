@@ -14,4 +14,10 @@ mod vocos;
 
 pub use ecapa::{Ecapa, EcapaConfig};
 pub use fast_u2pp::{FastU2pp, FastU2ppConfig};
+
+/// Exposed for parity debugging.
+#[doc(hidden)]
+pub fn debug_sinusoidal_pe(len: usize, d: usize, dev: &candle_core::Device) -> crate::Result<candle_core::Tensor> {
+    Ok(fast_u2pp::sinusoidal_pe(len, d, dev)?)
+}
 pub use vocos::{Vocos, VocosConfig};

@@ -83,6 +83,17 @@ impl Default for FastU2ppConfig {
 }
 
 impl FastU2ppConfig {
+    /// The released MeanVC v1 checkpoint (`fastu2++.pt`): global CMVN and
+    /// the official decode chunking (5-frame chunks, 2 left chunks).
+    pub fn official_meanvc1() -> Self {
+        Self {
+            chunk_frames: 5,
+            left_chunks: 2,
+            cmvn: true,
+            ..Self::default()
+        }
+    }
+
     /// Filterbank settings for the front-end (25 ms window / 10 ms hop).
     pub fn feature_config(&self) -> MelConfig {
         MelConfig {
@@ -98,7 +109,7 @@ impl FastU2ppConfig {
 }
 
 /// Sinusoidal positional encoding table `[1, len, d_model]`.
-fn sinusoidal_pe(len: usize, d_model: usize, device: &Device) -> candle_core::Result<Tensor> {
+pub(crate) fn sinusoidal_pe(len: usize, d_model: usize, device: &Device) -> candle_core::Result<Tensor> {
     let mut data = vec![0f32; len * d_model];
     for pos in 0..len {
         for i in 0..d_model / 2 {
@@ -293,10 +304,9 @@ impl ConvolutionModule {
     /// `x`: `[batch, time, d]`.
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = x.transpose(1, 2)?; // [b, d, t]
-        let x = self.pointwise_conv1.forward(&x)?;
-        // GLU over the channel dim.
-        let halves = x.chunk(2, 1)?;
-        let x = halves[0].mul(&candle_nn::ops::sigmoid(&halves[1])?)?;
+        // WeNet pads the module INPUT, before pointwise_conv1/GLU. Padding
+        // after the GLU is not equivalent: pointwise_conv1 has a bias, so
+        // the padded zeros become non-zero before the depthwise conv.
         let (b, d, _) = x.dims3()?;
         let x = if self.causal {
             // Causal left padding keeps the module streamable.
@@ -306,6 +316,10 @@ impl ConvolutionModule {
             let pad = Tensor::zeros((b, d, (self.kernel - 1) / 2), x.dtype(), x.device())?;
             Tensor::cat(&[pad.clone(), x, pad], 2)?
         };
+        let x = self.pointwise_conv1.forward(&x)?;
+        // GLU over the channel dim.
+        let halves = x.chunk(2, 1)?;
+        let x = halves[0].mul(&candle_nn::ops::sigmoid(&halves[1])?)?;
         let x = self.depthwise_conv.forward(&x)?;
         let x = match &self.norm {
             ConvNorm::Layer(ln) => ln.forward(&x.transpose(1, 2)?)?.transpose(1, 2)?,
@@ -450,6 +464,24 @@ impl FastU2pp {
 
     pub fn config(&self) -> &FastU2ppConfig {
         &self.cfg
+    }
+
+    /// Subsampled embedding before the conformer stack (×`xscale`),
+    /// exposed for parity debugging against the official `encoder.embed`.
+    pub fn subsample(&self, features: &Tensor) -> Result<Tensor> {
+        Ok(self
+            .embed
+            .forward(features)?
+            .affine((self.cfg.d_model as f64).sqrt(), 0.0)?)
+    }
+
+    /// Runs only the first conformer block on a subsampled embedding
+    /// (parity debugging).
+    #[doc(hidden)]
+    pub fn debug_layer0(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+        let t = x.dim(1)?;
+        let mask = frc::layer_mask(t, self.cfg.chunk_frames, self.cfg.left_chunks.min(t), 0, x.device())?;
+        Ok(self.encoders[0].forward(x, pos_emb, &mask)?)
     }
 
     /// Encodes filterbank features `[batch, time, n_mels]` into BNFs

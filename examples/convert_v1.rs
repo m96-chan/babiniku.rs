@@ -51,13 +51,7 @@ fn main() -> anyhow::Result<()> {
 
     // Models (all official weights).
     let model = MeanVc1::load(MeanVc1Config::default(), "ckpt/model_200ms.safetensors", &device)?;
-    let asr_cfg = FastU2ppConfig {
-        // Official decode: 5-frame chunks with 2 left chunks.
-        chunk_frames: 5,
-        left_chunks: 2,
-        ..FastU2ppConfig::default()
-    };
-    let asr = FastU2pp::load(asr_cfg, "ckpt/fastu2pp.safetensors", &device)?;
+    let asr = FastU2pp::load(FastU2ppConfig::official_meanvc1(), "ckpt/fastu2pp.safetensors", &device)?;
     let vocos = Vocos::load(VocosConfig::official_meanvc1(), "ckpt/vocos.safetensors", &device)?;
     println!("models loaded ({:.0?})", total.elapsed());
 
