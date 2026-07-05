@@ -7,3 +7,6 @@ Cargo.lock
 
 # local checkpoints for the v1 demo
 /ckpt/
+
+# agent worktrees
+/.claude/worktrees/

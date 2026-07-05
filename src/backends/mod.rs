@@ -11,6 +11,8 @@
 mod ecapa;
 mod fast_u2pp;
 mod vocos;
+#[cfg(feature = "wavlm")]
+mod wavlm_sv;
 
 pub use ecapa::{Ecapa, EcapaConfig};
 pub use fast_u2pp::{FastU2pp, FastU2ppConfig};
@@ -21,3 +23,5 @@ pub fn debug_sinusoidal_pe(len: usize, d: usize, dev: &candle_core::Device) -> c
     Ok(fast_u2pp::sinusoidal_pe(len, d, dev)?)
 }
 pub use vocos::{Vocos, VocosConfig};
+#[cfg(feature = "wavlm")]
+pub use wavlm_sv::WavLmSv;
