@@ -54,7 +54,6 @@ struct Stats {
     chunks: u64,
     late: u64,
     passthrough: bool,
-    sink_ok: bool,
     status: String,
 }
 
@@ -182,7 +181,6 @@ fn main() -> anyhow::Result<()> {
     let sink_ok = !modules.is_empty();
 
     let stats = Arc::new(Mutex::new(Stats {
-        sink_ok,
         status: if sink_ok {
             format!("virtual mic \"{VIRT_MIC}\" is live — select \"MeanVC-Virtual-Mic\" in your app")
         } else {
