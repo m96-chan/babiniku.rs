@@ -48,6 +48,7 @@ Fixtures come in two tiers:
 | | `ckpt/pipeline_ref.safetensors` | `v1::KaldiFbank` vs `torchaudio.compliance.kaldi.fbank` (< 1e-3) and the full BNF path vs the official chunked decode loop (< 0.05) | ✅ |
 | `gen_mel_fixture.py` | `fixtures/mel.safetensors` | `MelSpectrogram` vs torchaudio | planned (#8) |
 | `convert_ecapa.py` | — | SpeechBrain ECAPA checkpoint → safetensors + golden output | planned (#8) |
+| `convert_xvc_generator.py` | `ckpt/{xvc_codec,xvc_converter}.safetensors` | official `xvc.pt` generator → safetensors loadable by `xvc::{SacCodec, AcousticConverter}` (official names 1:1, `weight_norm` `g·v/‖v‖` pairs folded into plain conv weights) | ✅ |
 | `gen_xvc_fixtures.py` | `ckpt/xvc_preprocess_fixture.safetensors` | X-VC preprocessing: volume-norm + 40 Hz highpass + pad-to-1280 (< 1e-5) and the Whisper 128-mel log spectrogram (< 1e-4) | ✅ |
 | | `ckpt/xvc_tokenizer_fixture.safetensors` | GLM-4-Voice tokenizer: pre/post-VQ hidden states (< 1e-3), VQ token ids (exact), 50 Hz hidden, `embed_ids`, semantic adapter (< 1e-4) | ✅ |
 | | `ckpt/xvc_speaker_fixture.safetensors` | ERes2Net: Kaldi fbank-80 mean-norm (< 1e-3) → 192-d embedding (cos > 0.9999) | ✅ |
@@ -57,6 +58,7 @@ Fixtures come in two tiers:
 | | `ckpt/xvc_e2e_fixture.safetensors` | out.wav → test.wav end to end: offline + streaming (official 2400/120/100/20 and CPU 640/240/100/20 presets) | ✅ |
 | | `ckpt/xvc_inventory.json` | module path → tensor shape for `xvc.pt` / GLM-4-Voice tokenizer / ERes2Net (porting reference) | ✅ |
 | `convert_xvc_tokenizer.py` | `ckpt/xvc_tokenizer.safetensors` | GLM-4-Voice tokenizer (343.6M) + `semantic_adapter` (29.3M) weights, fp32, official names 1:1 → loaded by `xvc::tokenizer::load` and the `crates/xvc/tests/golden_tokenizer.rs` suite | ✅ |
+| `convert_xvc_speaker.py` | `ckpt/xvc_speaker.safetensors` | ERes2Net speaker-encoder weights from `xvc.pt` (`speaker_encoder.model.*` — its BatchNorm running stats drifted from the ModelScope release during X-VC training) → `xvc::speaker::SpeakerEncoder`, verified by `crates/xvc/tests/golden_speaker.rs` | ✅ |
 
 The X-VC fixtures ([issue #30](https://github.com/m96-chan/babiniku.rs/issues/30)
 Phase 1) need the official [Jerrister/X-VC](https://github.com/Jerrister/X-VC)
