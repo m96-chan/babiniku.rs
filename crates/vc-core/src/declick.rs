@@ -36,18 +36,36 @@ pub struct NeedleGuard {
     ctx: usize,
     /// Max repairable run length (samples).
     max_run: usize,
+    /// Isolation context length (samples).
+    iso: usize,
     /// Pending samples: `[processed-context | unprocessed]`.
     buf: Vec<f32>,
     /// Number of needle runs repaired so far.
     pub repaired: u64,
 }
 
-/// Absolute amplitude floor for a needle candidate.
-const ABS_FLOOR: f32 = 0.30;
-/// Candidate threshold as a multiple of the local median |y|.
-const RATIO: f32 = 8.0;
+/// Absolute amplitude floor for a needle candidate. The decoder emits
+/// needles scaled with the local signal, down to ~0.12 in quiet speech
+/// (sixth field recording); 0.10 catches those while staying above any
+/// plausible noise-floor content.
+const ABS_FLOOR: f32 = 0.10;
+/// Candidate threshold as a multiple of the local median |y|. Natural
+/// glottal peaks in converted speech stay under ~5x their local median;
+/// field-recording needles measure 6.2–8x.
+const RATIO: f32 = 6.0;
+/// Floor for the local median, so a silent context (median ≈ 0, e.g.
+/// right after the input gate opens) cannot make every voiced sample
+/// look like an infinite-ratio needle.
+const MED_FLOOR: f32 = 0.012;
 /// Guard margin repaired around a detected run (samples).
 const MARGIN: usize = 8;
+/// Isolation context checked on both sides of a run (seconds): a needle
+/// is a lone pulse, so its neighbourhood stays well below the run peak.
+/// Speech onsets fail this check — the next glottal cycle follows at a
+/// comparable amplitude within 2 ms — and are left untouched.
+const ISO_SECS: f32 = 0.002;
+/// Neighbourhood-to-peak bound for the isolation check.
+const ISO_RATIO: f32 = 0.65;
 
 impl NeedleGuard {
     /// `sample_rate` is the rate of the processed stream (16 kHz for the
@@ -56,6 +74,7 @@ impl NeedleGuard {
         Self {
             ctx: (0.008 * sample_rate) as usize,
             max_run: (0.0025 * sample_rate) as usize,
+            iso: (ISO_SECS * sample_rate) as usize,
             buf: Vec::new(),
             repaired: 0,
         }
@@ -105,7 +124,7 @@ impl NeedleGuard {
                 i += 1;
                 continue;
             }
-            let med = self.local_median(i);
+            let med = self.local_median(i).max(MED_FLOOR);
             if y <= RATIO * med {
                 i += 1;
                 continue;
@@ -116,7 +135,17 @@ impl NeedleGuard {
             while j < scan_end && j - i <= self.max_run && self.buf[j].abs() > run_thr {
                 j += 1;
             }
-            if j - i <= self.max_run && j < scan_end {
+            let iso = self.iso;
+            let run_peak = self.buf[i..j].iter().fold(0f32, |m, s| m.max(s.abs()));
+            let side_peak = |lo: usize, hi: usize| -> f32 {
+                self.buf[lo.min(self.buf.len())..hi.min(self.buf.len())]
+                    .iter()
+                    .fold(0f32, |m, s| m.max(s.abs()))
+            };
+            let left = side_peak(i.saturating_sub(MARGIN + iso), i.saturating_sub(MARGIN));
+            let right = side_peak(j + MARGIN, j + MARGIN + iso);
+            let isolated = left < ISO_RATIO * run_peak && right < ISO_RATIO * run_peak;
+            if isolated && j - i <= self.max_run && j < scan_end {
                 let lo = i.saturating_sub(MARGIN);
                 let hi = (j + MARGIN).min(self.buf.len() - 1);
                 let (a, b) = (self.buf[lo], self.buf[hi]);
@@ -128,8 +157,8 @@ impl NeedleGuard {
                 self.repaired += 1;
                 i = hi + 1;
             } else {
-                // Too long to be a needle (or context still incomplete):
-                // skip past it untouched.
+                // Too long, not isolated (a speech onset), or context
+                // still incomplete: skip past it untouched.
                 i = j;
             }
         }
@@ -207,6 +236,24 @@ mod tests {
         for i in 7_900..8_100 {
             assert_eq!(y[i + d], expected[i], "natural pulse modified at {i}");
         }
+    }
+
+    #[test]
+    fn removes_small_needle_in_quiet_speech() {
+        // Sixth field recording: needles scale down with the local
+        // signal — a 0.13 pulse over a 0.02-median passage still clicks.
+        let mut x: Vec<f32> = vowel(16_000).iter().map(|s| s * 0.25).collect();
+        for k in 0..5 {
+            x[8_000 + k] = 0.13;
+        }
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        let d = g.latency();
+        let peak = y[8_000 + d - 32..8_000 + d + 32]
+            .iter()
+            .fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.08, "small needle survived: local peak {peak}");
+        assert_eq!(g.repaired, 1);
     }
 
     #[test]
