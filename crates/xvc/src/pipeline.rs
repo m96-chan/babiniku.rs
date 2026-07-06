@@ -765,9 +765,22 @@ const XCHK_MARGIN: usize = 8;
 /// A run qualifies only when the held hop's sharpness exceeds the other
 /// rendering's by this factor — genuine re-rendering differences (phase
 /// drift, level) are symmetric in sharpness and never qualify.
-const XCHK_SHARPNESS: f32 = 2.5;
+const XCHK_SHARPNESS: f32 = 4.0;
 /// Divergence floor: |held − other| must exceed this to open a run.
 const XCHK_DIV_FLOOR: f32 = 0.04;
+/// Needle-scale gate: the run's peak divergence must reach this before
+/// a replacement is considered. Ordinary re-rendering differences on
+/// dynamic live speech routinely open small short runs (measured ~every
+/// hop live), and replacing them is itself audible as a per-chunk tick;
+/// real needles diverge by ≥ 0.12 (field recordings) so this loses none
+/// of them.
+const XCHK_PEAK_FLOOR: f32 = 0.12;
+/// Absolute sharpness floor for the held run: a needle's second
+/// difference at 16 kHz is ≥ 0.3 (tanh-scale pulse over ≤ 5 samples);
+/// voiced speech sits at ~0.005–0.05 and sibilants at ~0.1–0.25. Live
+/// VQ re-rendering differences opened runs nearly every hop without
+/// this (xr ≈ 2/s on a clean vowel — >95 % false positives).
+const XCHK_SHARP_FLOOR: f32 = 0.3;
 
 /// Replaces needle-suspect runs of `held` by `other` (the next window's
 /// rendering of the same samples). Returns the number of replaced runs.
@@ -803,7 +816,17 @@ fn cross_check_repair(held: &mut [f32], other: &[f32]) -> u32 {
         while j < held.len() && j - i <= max_run && (held[j] - other[j]).abs() > 0.5 * thr {
             j += 1;
         }
-        if j - i <= max_run && sharpness(held, i, j) > XCHK_SHARPNESS * sharpness(other, i, j) {
+        let run_peak_d = held[i..j]
+            .iter()
+            .zip(&other[i..j])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let sharp_held = sharpness(held, i, j);
+        if j - i <= max_run
+            && run_peak_d > XCHK_PEAK_FLOOR
+            && sharp_held > XCHK_SHARP_FLOOR
+            && sharp_held > XCHK_SHARPNESS * sharpness(other, i, j)
+        {
             let lo = i.saturating_sub(XCHK_MARGIN);
             let hi = (j + XCHK_MARGIN).min(held.len());
             for k in lo..hi {
