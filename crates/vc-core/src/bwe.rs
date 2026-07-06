@@ -309,7 +309,8 @@ pub struct Exciter {
     /// One-pole smoothed envelope-matching gain (prevents the ×MAX_GAIN
     /// burst at speech onsets, where the harmonic envelope is still ~0).
     gain_state: f32,
-    gain_alpha: f32,
+    gain_up: f32,
+    gain_down: f32,
     /// Previous chunk's wet amount; knob changes ramp across the chunk.
     prev_wet: f32,
 }
@@ -333,8 +334,11 @@ impl Exciter {
             src_env: EnvFollower::new(sample_rate, 0.005, 0.050),
             harm_env: EnvFollower::new(sample_rate, 0.005, 0.050),
             gain_state: 0.0,
-            // ~10 ms time constant at the processing rate.
-            gain_alpha: 1.0 - (-1.0 / (0.010 * sample_rate)).exp(),
+            // Asymmetric gain slew: rising gain is slow (~80 ms) so a
+            // ceiling-parked gain cannot slam into a fresh harmonic burst,
+            // falling gain is fast (~3 ms) so bursts de-amplify instantly.
+            gain_up: 1.0 - (-1.0 / (0.080 * sample_rate)).exp(),
+            gain_down: 1.0 - (-1.0 / (0.003 * sample_rate)).exp(),
             prev_wet: 0.0,
         }
     }
@@ -365,11 +369,22 @@ impl Exciter {
             // level instead of amplifying the noise floor at word onsets.
             let guard = (se / 2e-3).clamp(0.0, 1.0);
             let target = (se / (he + 1e-9)).min(Self::MAX_GAIN) * guard;
-            // Slew-limit the gain (~10 ms) so onsets cannot inject a
-            // full-scale harmonic burst in a single sample ("プツプツ").
-            self.gain_state += self.gain_alpha * (target - self.gain_state);
+            let alpha = if target > self.gain_state {
+                self.gain_up
+            } else {
+                self.gain_down
+            };
+            self.gain_state += alpha * (target - self.gain_state);
             if wet_now > 0.0 {
-                *s = x + wet_now * Self::TARGET_RATIO * self.gain_state * harm;
+                // Hard-bound the synthetic band by the source-band
+                // envelope: whatever the gain state, the added sample can
+                // never exceed the band's own level — spikes are clamped
+                // at the physics level (field report: ticks during
+                // sustained vowels came from gain*harm bursts, not from
+                // waveform steps).
+                let add = Self::TARGET_RATIO * self.gain_state * harm;
+                let bound = 1.5 * se;
+                *s = x + wet_now * add.clamp(-bound, bound);
             }
         }
         self.prev_wet = wet;
@@ -487,6 +502,49 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max);
         assert!(du < 1e-6, "upsampler chunk-boundary loss: max diff {du}");
+    }
+
+    /// Sustained-vowel spike regression (issue #42, real-recording
+    /// analysis): with a vowel-like signal whose 3-8 kHz band is weak and
+    /// fluctuating, the envelope-matching gain must not turn band bursts
+    /// into high-band clicks. Bound the added band's crest factor.
+    #[test]
+    fn exciter_vowel_shimmer_produces_no_spikes() {
+        // 250 Hz glottal-ish harmonic series with slow shimmer on the
+        // upper partials (deterministic).
+        let n = 48_000 * 3;
+        let mut sig = vec![0f32; n];
+        for h in 1..=30 {
+            let f = 250.0 * h as f32;
+            let a = 0.5 / h as f32;
+            for (i, s) in sig.iter_mut().enumerate() {
+                let t = i as f32 / SR_OUT;
+                let shim = if f > 3_000.0 {
+                    0.5 + 0.5 * (2.0 * PI * (1.7 + 0.13 * h as f32) * t).sin()
+                } else {
+                    1.0
+                };
+                *s += a * shim * (2.0 * PI * f * t).sin();
+            }
+        }
+        let dry = sig.clone();
+        let mut ex = Exciter::new(SR_OUT);
+        for c in sig.chunks_mut(11_520) {
+            ex.process(c, 1.0);
+        }
+        let added: Vec<f32> = sig.iter().zip(&dry).map(|(w, d)| w - d).collect();
+        // Envelope crest factor of the added band after settling.
+        let tail = &added[24_000..];
+        let fr = 96;
+        let env: Vec<f32> = tail
+            .chunks(fr)
+            .map(|c| c.iter().fold(0f32, |m, &v| m.max(v.abs())))
+            .collect();
+        let mut sorted = env.clone();
+        sorted.sort_by(f32::total_cmp);
+        let med = sorted[sorted.len() / 2] + 1e-9;
+        let crest = env.iter().fold(0f32, |m, &v| m.max(v)) / med;
+        assert!(crest < 4.0, "high-band click crest factor {crest}");
     }
 
     /// Energy of `x` in the band `[lo, hi)` Hz via FFT.
