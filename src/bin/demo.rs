@@ -11,9 +11,16 @@
 //! ```
 //!
 //! Keys: `q` quit · `p` passthrough (bypass conversion for A/B) ·
-//! `l` loopback monitor (hear the converted voice on the default output).
+//! `l` loopback monitor (hear the converted voice on the default output) ·
+//! `[` / `]` pitch shift −/+0.5 semitone (post-vocoder, Signalsmith
+//! Stretch) · `,` / `.` RNNoise denoise mix −/+10 % (pre-ASR, in-process;
+//! independent of the `--denoise` WebRTC stage).
 //!
-//! Options: `--wav <file>` converts a wav file instead of the microphone
+//! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` set the
+//! initial knob values, `--denoise` inserts PipeWire's WebRTC noise suppression in
+//! front of the microphone (recommended for noisy mics),
+//! `--input-device <source>` records from a specific PulseAudio source,
+//! `--wav <file>` converts a wav file instead of the microphone
 //! (paced in real time), `--headless` disables the TUI, `--out <file>`
 //! additionally records the converted audio, `--no-sink` skips creating
 //! the virtual device, `--monitor` starts with the loopback enabled,
@@ -37,6 +44,9 @@ use libpulse_simple_binding::Simple;
 use meanvc2::backends::{FastU2pp, FastU2ppConfig, Vocos, VocosConfig};
 use meanvc2::encoders::Vocoder;
 use meanvc2::v1::{interpolate_linear, KaldiFbank, KvCache, MeanVc1, MeanVc1Config, MelV1};
+use nnnoiseless::DenoiseState;
+use signalsmith_stretch::Stretch;
+use std::sync::atomic::AtomicI32;
 
 const SR: usize = 16_000;
 const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
@@ -47,6 +57,18 @@ const MEL_TAIL: usize = 20; // vocoder left context, in mel frames
 const SINK: &str = "meanvc";
 const VIRT_MIC: &str = "meanvc_mic";
 
+/// Live-tunable knobs shared with the TUI thread.
+struct Controls {
+    /// Pitch shift in tenths of a semitone (post-vocoder).
+    pitch_decisemitones: AtomicI32,
+    /// RNNoise dry/wet mix in percent (0 = off).
+    denoise_mix: AtomicI32,
+    /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
+    /// voiced murmurs on silent input, so sub-threshold chunks bypass the
+    /// DiT and emit silence. i32::MIN disables.
+    gate_db: AtomicI32,
+}
+
 #[derive(Default)]
 struct Stats {
     in_rms: f32,
@@ -56,6 +78,7 @@ struct Stats {
     rtf_voc: f32,
     chunks: u64,
     late: u64,
+    gated: u64,
     passthrough: bool,
     status: String,
 }
@@ -65,9 +88,14 @@ struct Args {
     voice_print: Option<String>,
     wav: Option<String>,
     out: Option<String>,
+    input_device: Option<String>,
+    pitch_shift: f32,
+    denoise_mix: i32,
+    gate_db: i32,
     headless: bool,
     no_sink: bool,
     monitor: bool,
+    denoise: bool,
     duration: Option<f32>,
 }
 
@@ -77,9 +105,14 @@ fn parse_args() -> Args {
         voice_print: None,
         wav: None,
         out: None,
+        input_device: None,
+        pitch_shift: 0.0,
+        denoise_mix: 0,
+        gate_db: -45,
         headless: false,
         no_sink: false,
         monitor: false,
+        denoise: false,
         duration: None,
     };
     let mut it = std::env::args().skip(1);
@@ -92,6 +125,17 @@ fn parse_args() -> Args {
             "--headless" => a.headless = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
+            "--denoise" => a.denoise = true,
+            "--pitch-shift" => {
+                a.pitch_shift = it.next().and_then(|v| v.parse().ok()).expect("--pitch-shift <semitones>")
+            }
+            "--denoise-mix" => {
+                a.denoise_mix = it.next().and_then(|v| v.parse().ok()).expect("--denoise-mix <0-100>")
+            }
+            "--gate" => {
+                a.gate_db = it.next().and_then(|v| v.parse().ok()).expect("--gate <dBFS, e.g. -45>")
+            }
+            "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -128,6 +172,76 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
         "source_properties=device.description=MeanVC-Virtual-Mic",
     ])?;
     Ok(vec![sink, mic])
+}
+
+const DENOISED_SRC: &str = "meanvc_denoised";
+
+/// In-process RNNoise at 16 kHz: exact x3 up/down resampling around the
+/// 48 kHz, 480-sample RNNoise frames (3200 in -> 20 frames -> 3200 out).
+struct Rnnoise16k {
+    state: Box<DenoiseState<'static>>,
+    prev: f32,
+}
+
+impl Rnnoise16k {
+    fn new() -> Self {
+        Self {
+            state: DenoiseState::new(),
+            prev: 0.0,
+        }
+    }
+
+    fn process(&mut self, chunk: &[f32]) -> Vec<f32> {
+        // Linear x3 upsample (16k -> 48k), i16 scaling for RNNoise.
+        let n = chunk.len();
+        let mut up = Vec::with_capacity(n * 3);
+        let mut last = self.prev;
+        for &s in chunk {
+            up.push((last + (s - last) / 3.0) * 32768.0);
+            up.push((last + 2.0 * (s - last) / 3.0) * 32768.0);
+            up.push(s * 32768.0);
+            last = s;
+        }
+        self.prev = last;
+        let mut den = vec![0f32; up.len()];
+        for (i_chunk, o_chunk) in up.chunks(DenoiseState::FRAME_SIZE).zip(den.chunks_mut(DenoiseState::FRAME_SIZE)) {
+            self.state.process_frame(o_chunk, i_chunk);
+        }
+        // 3-tap mean + decimate (48k -> 16k).
+        (0..n)
+            .map(|i| {
+                let j = i * 3;
+                let a = den[j];
+                let b = den.get(j + 1).copied().unwrap_or(a);
+                let c = den.get(j + 2).copied().unwrap_or(b);
+                (a + b + c) / (3.0 * 32768.0)
+            })
+            .collect()
+    }
+}
+
+/// PipeWire/Pulse WebRTC noise suppression in front of the microphone:
+/// creates a cleaned source the input thread records from. Returns the
+/// pactl module id.
+fn create_denoiser(master: Option<&str>) -> anyhow::Result<String> {
+    let mut cmd = Command::new("pactl");
+    cmd.args([
+        "load-module",
+        "module-echo-cancel",
+        &format!("source_name={DENOISED_SRC}"),
+        "aec_method=webrtc",
+        "source_properties=device.description=MeanVC-Denoised-Input",
+    ]);
+    if let Some(m) = master {
+        cmd.arg(format!("source_master={m}"));
+    }
+    let out = cmd.output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "pactl module-echo-cancel failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Loopback monitor: routes the converted audio to the default output so
@@ -217,7 +331,8 @@ fn load_voice_print(args: &Args, reference: &[f32], device: &Device) -> anyhow::
     }
     #[cfg(not(feature = "wavlm"))]
     anyhow::bail!(
-        "no --voice-print given and the "wavlm" feature is off; pass a precomputed          voice print or rebuild with --features demo,wavlm"
+        "no --voice-print given and the wavlm feature is off; pass a precomputed \
+         voice print or rebuild with --features demo,wavlm"
     )
 }
 
@@ -260,17 +375,29 @@ fn main() -> anyhow::Result<()> {
     let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
     let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
 
-    let modules = if args.no_sink {
+    let mut modules = if args.no_sink {
         Vec::new()
     } else {
         create_virtual_device()?
     };
     let sink_ok = !modules.is_empty();
+    // Optional noise suppression in front of the mic.
+    let capture_device: Option<String> = if args.denoise && args.wav.is_none() {
+        modules.push(create_denoiser(args.input_device.as_deref())?);
+        Some(DENOISED_SRC.to_string())
+    } else {
+        args.input_device.clone()
+    };
     let monitor = Arc::new(Monitor(Mutex::new(None)));
     if args.monitor && sink_ok {
         monitor.toggle()?;
     }
 
+    let controls = Arc::new(Controls {
+        pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
+        denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        gate_db: AtomicI32::new(args.gate_db),
+    });
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
             format!(
@@ -287,7 +414,19 @@ fn main() -> anyhow::Result<()> {
     let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
     let run_in = run.clone();
     let wav_src = args.wav.clone();
+    let capture_device = capture_device.clone();
+    let controls_in = controls.clone();
     let input = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut rnnoise = Rnnoise16k::new();
+        let mut denoise_chunk = |c: Vec<f32>| -> Vec<f32> {
+            let mix = controls_in.denoise_mix.load(Ordering::Relaxed).clamp(0, 100);
+            if mix == 0 {
+                return c;
+            }
+            let wet = rnnoise.process(&c);
+            let w = mix as f32 / 100.0;
+            c.iter().zip(&wet).map(|(d, n)| d * (1.0 - w) + n * w).collect()
+        };
         match wav_src {
             Some(path) => {
                 let samples = read_wav_16k(&path)?;
@@ -303,7 +442,7 @@ fn main() -> anyhow::Result<()> {
                     if let Some(wait) = due.checked_sub(t0.elapsed()) {
                         std::thread::sleep(wait);
                     }
-                    if tx_in.send(c).is_err() {
+                    if tx_in.send(denoise_chunk(c)).is_err() {
                         break;
                     }
                 }
@@ -314,7 +453,7 @@ fn main() -> anyhow::Result<()> {
                     None,
                     "meanvc-demo",
                     Direction::Record,
-                    None,
+                    capture_device.as_deref(),
                     "capture",
                     &pulse_spec(),
                     None,
@@ -328,7 +467,7 @@ fn main() -> anyhow::Result<()> {
                         .chunks_exact(4)
                         .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
                         .collect();
-                    if tx_in.send(c).is_err() {
+                    if tx_in.send(denoise_chunk(c)).is_err() {
                         break;
                     }
                 }
@@ -347,7 +486,10 @@ fn main() -> anyhow::Result<()> {
     let run_out = run.clone();
     let out_path = args.out.clone();
     let stats_out = stats.clone();
+    let controls_out = controls.clone();
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut stretch = Stretch::preset_default(1, SR as u32);
+        let mut current_semi = 0f32;
         let play = if sink_ok {
             Some(
                 Simple::new(
@@ -403,6 +545,20 @@ fn main() -> anyhow::Result<()> {
                     out
                 }
             };
+            // Post-vocoder pitch shift (Signalsmith Stretch), bypassed at 0
+            // to avoid its internal latency.
+            let semi = controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
+            let chunk: Vec<f32> = if semi.abs() > 0.05 {
+                if (semi - current_semi).abs() > 0.01 {
+                    stretch.set_transpose_factor_semitones(semi, None);
+                    current_semi = semi;
+                }
+                let mut shifted = vec![0f32; chunk.len()];
+                stretch.process(&chunk, &mut shifted);
+                shifted
+            } else {
+                chunk
+            };
             if let Some(p) = &play {
                 let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_ne_bytes()).collect();
                 p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
@@ -422,6 +578,7 @@ fn main() -> anyhow::Result<()> {
     // --- conversion thread
     let stats_vc = stats.clone();
     let run_vc = run.clone();
+    let controls_vc = controls.clone();
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let fbank = KaldiFbank::new();
         // Incremental front end: raw-sample carry for the fbank framing and
@@ -432,12 +589,37 @@ fn main() -> anyhow::Result<()> {
         let mut kv = KvCache::default();
         let mut prev_mel: Option<Tensor> = None;
         let mut q = 0usize;
+        // Gate hangover: keep converting this many chunks after the level
+        // drops, so word tails are not clipped.
+        const HANGOVER: u32 = 2;
+        let mut open_for = 0u32;
         while run_vc.load(Ordering::Relaxed) {
             let Ok(chunk) = rx_in.recv_timeout(Duration::from_millis(300)) else {
                 continue;
             };
             let passthrough = stats_vc.lock().unwrap().passthrough;
             let in_level = rms(&chunk);
+            // Input energy gate: silence makes the DiT hallucinate voiced
+            // murmurs, so sub-threshold chunks emit silence directly (the
+            // CARD state freezes and resumes seamlessly on the next chunk).
+            let gate = controls_vc.gate_db.load(Ordering::Relaxed);
+            if !passthrough {
+                let db = 20.0 * in_level.max(1e-9).log10();
+                if db >= gate as f32 {
+                    open_for = HANGOVER + 1;
+                }
+                open_for = open_for.saturating_sub(1);
+                if open_for == 0 {
+                    let mut st = stats_vc.lock().unwrap();
+                    st.in_rms = in_level;
+                    st.out_rms = 0.0;
+                    st.chunks += 1;
+                    st.gated += 1;
+                    drop(st);
+                    let _ = tx_out.send(OutMsg::Raw(vec![0.0; CHUNK_SAMPLES]));
+                    continue;
+                }
+            }
             if passthrough {
                 // Drop the streaming state: the ASR caches must not carry
                 // context across the bypassed audio.
@@ -548,6 +730,7 @@ fn main() -> anyhow::Result<()> {
             stats.clone(),
             run.clone(),
             monitor.clone(),
+            controls.clone(),
             sink_ok,
             args.duration,
         )?;
@@ -569,6 +752,7 @@ fn run_tui(
     stats: Arc<Mutex<Stats>>,
     run: Arc<AtomicBool>,
     monitor: Arc<Monitor>,
+    controls: Arc<Controls>,
     sink_ok: bool,
     duration: Option<f32>,
 ) -> anyhow::Result<()> {
@@ -600,6 +784,7 @@ fn run_tui(
                 st.late,
                 st.passthrough,
                 st.status.clone(),
+                st.gated,
             )
         };
         terminal.draw(|f| {
@@ -607,7 +792,7 @@ fn run_tui(
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
-                Constraint::Length(4),
+                Constraint::Length(5),
                 Constraint::Min(3),
             ])
             .split(f.area());
@@ -647,15 +832,22 @@ fn run_tui(
                     .label(format!("{total:.2}")),
                 rows[2],
             );
+            let pitch = controls.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
+            let mix = controls.denoise_mix.load(Ordering::Relaxed);
+            let gate = controls.gate_db.load(Ordering::Relaxed);
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  asr {:.2} · vc {:.2} · vocoder {:.2}\nchunks {} · late {} · mode {}",
+                    "RTF  asr {:.2} · vc {:.2} · vocoder {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
                     snapshot.2,
                     snapshot.3,
                     snapshot.4,
                     snapshot.5,
                     snapshot.6,
+                    snapshot.9,
                     if snapshot.7 { "PASSTHROUGH" } else { "CONVERT" },
+                    pitch,
+                    mix,
+                    gate,
                 ))
                 .block(Block::default().borders(Borders::ALL).title(" pipeline ")),
                 rows[3],
@@ -688,6 +880,30 @@ fn run_tui(
                     }
                     KeyCode::Char('l') if sink_ok => {
                         monitoring = monitor.toggle().unwrap_or(monitoring);
+                    }
+                    KeyCode::Char('[') => {
+                        let v = controls.pitch_decisemitones.load(Ordering::Relaxed);
+                        controls.pitch_decisemitones.store((v - 5).max(-120), Ordering::Relaxed);
+                    }
+                    KeyCode::Char(']') => {
+                        let v = controls.pitch_decisemitones.load(Ordering::Relaxed);
+                        controls.pitch_decisemitones.store((v + 5).min(120), Ordering::Relaxed);
+                    }
+                    KeyCode::Char(',') => {
+                        let v = controls.denoise_mix.load(Ordering::Relaxed);
+                        controls.denoise_mix.store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('.') => {
+                        let v = controls.denoise_mix.load(Ordering::Relaxed);
+                        controls.denoise_mix.store((v + 10).min(100), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('-') => {
+                        let v = controls.gate_db.load(Ordering::Relaxed);
+                        controls.gate_db.store((v - 3).max(-90), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('=') => {
+                        let v = controls.gate_db.load(Ordering::Relaxed);
+                        controls.gate_db.store((v + 3).min(-10), Ordering::Relaxed);
                     }
                     _ => {}
                 }
