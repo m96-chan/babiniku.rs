@@ -19,6 +19,7 @@
 pub mod audio;
 pub mod bwe;
 pub mod config;
+pub mod declick;
 pub mod encoders;
 
 pub use config::MelConfig;

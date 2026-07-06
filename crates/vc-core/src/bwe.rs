@@ -334,10 +334,14 @@ impl Exciter {
             src_env: EnvFollower::new(sample_rate, 0.005, 0.050),
             harm_env: EnvFollower::new(sample_rate, 0.005, 0.050),
             gain_state: 0.0,
-            // Asymmetric gain slew: rising gain is slow (~80 ms) so a
+            // Asymmetric gain slew: rising gain is slewed (~15 ms) so a
             // ceiling-parked gain cannot slam into a fresh harmonic burst,
             // falling gain is fast (~3 ms) so bursts de-amplify instantly.
-            gain_up: 1.0 - (-1.0 / (0.080 * sample_rate)).exp(),
+            // 15 ms keeps onsets bright — the original 80 ms rise dulled
+            // every word onset, and the burst it guarded against turned
+            // out to be the decoder needle (now repaired upstream by
+            // `declick::NeedleGuard`).
+            gain_up: 1.0 - (-1.0 / (0.015 * sample_rate)).exp(),
             gain_down: 1.0 - (-1.0 / (0.003 * sample_rate)).exp(),
             prev_wet: 0.0,
         }

@@ -1,0 +1,256 @@
+//! Surgical needle-pulse suppressor for neural-decoder output.
+//!
+//! The X-VC SAC decoder occasionally emits a single needle pulse — a
+//! ≲2.5 ms burst driven into the final `tanh` (|y| ≈ 1) that sits an
+//! order of magnitude above the surrounding waveform (issue #42; the
+//! stage probe shows the converter/prenet/codec features are smooth and
+//! the spike is born inside the decoder, identically on CPU and CUDA).
+//! It is a property of the whole re-encoded window, so overlapping
+//! windows do not reproduce it — it cannot be cross-checked away, only
+//! repaired in the time domain.
+//!
+//! Detection is deliberately conservative, so ordinary speech is never
+//! touched (the lesson of the earlier blind inter-chunk declicker, which
+//! false-positived on normal waveform slopes):
+//!
+//! - the local statistic is the **median** absolute sample over a ±8 ms
+//!   context, which the needle itself cannot inflate (a 2.5 ms run is
+//!   < 1/6 of the window);
+//! - a sample is a needle candidate only if `|y| > ABS_FLOOR` (0.30)
+//!   **and** `|y| > RATIO × median` (8× — natural glottal pulses in
+//!   converted speech stay under ~5× their local median);
+//! - only contiguous runs up to 2.5 ms are repaired; anything longer is
+//!   real audio by definition and is left alone.
+//!
+//! Repair bridges the run (plus a small guard margin) with linear
+//! interpolation — over ≲3 ms this is inaudible in voiced speech.
+//!
+//! The suppressor is streaming: [`NeedleGuard::process`] consumes a
+//! chunk and returns the same number of samples delayed by the context
+//! length, with state carried across chunks (chunked output equals
+//! one-shot output exactly).
+
+/// Streaming needle suppressor (see the module docs).
+pub struct NeedleGuard {
+    /// Context half-window (samples).
+    ctx: usize,
+    /// Max repairable run length (samples).
+    max_run: usize,
+    /// Pending samples: `[processed-context | unprocessed]`.
+    buf: Vec<f32>,
+    /// Number of needle runs repaired so far.
+    pub repaired: u64,
+}
+
+/// Absolute amplitude floor for a needle candidate.
+const ABS_FLOOR: f32 = 0.30;
+/// Candidate threshold as a multiple of the local median |y|.
+const RATIO: f32 = 8.0;
+/// Guard margin repaired around a detected run (samples).
+const MARGIN: usize = 8;
+
+impl NeedleGuard {
+    /// `sample_rate` is the rate of the processed stream (16 kHz for the
+    /// X-VC decoder output).
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            ctx: (0.008 * sample_rate) as usize,
+            max_run: (0.0025 * sample_rate) as usize,
+            buf: Vec::new(),
+            repaired: 0,
+        }
+    }
+
+    /// Latency introduced by the guard, in samples: median context plus
+    /// enough slack that a run touching the emit horizon is always fully
+    /// judged before its samples leave the buffer.
+    pub fn latency(&self) -> usize {
+        self.ctx + self.max_run + MARGIN
+    }
+
+    /// Median absolute value over `[c-ctx, c+ctx]` clamped to the buffer.
+    fn local_median(&self, c: usize) -> f32 {
+        let lo = c.saturating_sub(self.ctx);
+        let hi = (c + self.ctx + 1).min(self.buf.len());
+        let mut mag: Vec<f32> = self.buf[lo..hi].iter().map(|s| s.abs()).collect();
+        let mid = mag.len() / 2;
+        mag.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        mag[mid]
+    }
+
+    /// Feeds `chunk` and returns the next `chunk.len()` processed
+    /// samples (delayed by [`Self::latency`]; the first call is padded
+    /// with leading zeros).
+    pub fn process(&mut self, chunk: &[f32]) -> Vec<f32> {
+        if self.buf.is_empty() {
+            // Prime the delay line so output length always matches input.
+            self.buf = vec![0.0; self.latency()];
+        }
+        self.buf.extend_from_slice(chunk);
+
+        // Candidates are scanned wherever the median context is complete
+        // (up to buf.len() - ctx). The emit horizon holds back a further
+        // max_run + MARGIN samples so any run overlapping emitted audio
+        // has already been fully judged (and repaired) before it leaves.
+        let emit = self
+            .buf
+            .len()
+            .saturating_sub(self.latency())
+            .min(chunk.len());
+        let scan_end = self.buf.len().saturating_sub(self.ctx);
+        let mut i = 0;
+        while i < scan_end {
+            let y = self.buf[i].abs();
+            if y < ABS_FLOOR {
+                i += 1;
+                continue;
+            }
+            let med = self.local_median(i);
+            if y <= RATIO * med {
+                i += 1;
+                continue;
+            }
+            // Grow the run while samples stay above a relaxed bound.
+            let run_thr = (RATIO * 0.5) * med;
+            let mut j = i + 1;
+            while j < scan_end && j - i <= self.max_run && self.buf[j].abs() > run_thr {
+                j += 1;
+            }
+            if j - i <= self.max_run && j < scan_end {
+                let lo = i.saturating_sub(MARGIN);
+                let hi = (j + MARGIN).min(self.buf.len() - 1);
+                let (a, b) = (self.buf[lo], self.buf[hi]);
+                let n = hi - lo;
+                for (k, s) in self.buf[lo..=hi].iter_mut().enumerate() {
+                    let w = k as f32 / n as f32;
+                    *s = a * (1.0 - w) + b * w;
+                }
+                self.repaired += 1;
+                i = hi + 1;
+            } else {
+                // Too long to be a needle (or context still incomplete):
+                // skip past it untouched.
+                i = j;
+            }
+        }
+
+        let out: Vec<f32> = self.buf.drain(..emit).collect();
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vowel-like test signal: 300 Hz with harmonics, rms ≈ 0.1.
+    fn vowel(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                let f = 300.0;
+                0.09 * (2.0 * std::f32::consts::PI * f * t).sin()
+                    + 0.05 * (4.0 * std::f32::consts::PI * f * t).sin()
+                    + 0.03 * (6.0 * std::f32::consts::PI * f * t).sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transparent_on_clean_speechlike_audio() {
+        let x = vowel(16_000);
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        assert_eq!(y.len(), x.len());
+        let d = g.latency();
+        // Output is the input delayed by `latency()`, bit-exact.
+        for i in 0..x.len() - d {
+            assert_eq!(y[i + d], x[i], "sample {i} modified on clean audio");
+        }
+        assert_eq!(g.repaired, 0);
+    }
+
+    #[test]
+    fn removes_decoder_needle() {
+        let mut x = vowel(16_000);
+        // A 7-sample tanh-saturated needle like the SAC decoder emits.
+        for k in 0..7 {
+            x[8_000 + k] = if k % 2 == 0 { 0.95 } else { -0.9 };
+        }
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        let d = g.latency();
+        let peak = y[8_000 + d - 32..8_000 + d + 32]
+            .iter()
+            .fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.3, "needle survived: local peak {peak}");
+        assert_eq!(g.repaired, 1);
+    }
+
+    #[test]
+    fn keeps_natural_glottal_peaks() {
+        // A sharp but natural pulse: 4x the local median is loud speech,
+        // not a needle.
+        let mut x = vowel(16_000);
+        let med: f32 = {
+            let mut m: Vec<f32> = x.iter().map(|s| s.abs()).collect();
+            m.sort_by(|a, b| a.total_cmp(b));
+            m[m.len() / 2]
+        };
+        for k in 0..12 {
+            x[8_000 + k] += 3.5 * med * (std::f32::consts::PI * k as f32 / 12.0).sin();
+        }
+        let expected = x.clone();
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        let d = g.latency();
+        for i in 7_900..8_100 {
+            assert_eq!(y[i + d], expected[i], "natural pulse modified at {i}");
+        }
+    }
+
+    #[test]
+    fn chunked_equals_oneshot() {
+        let mut x = vowel(32_000);
+        for k in 0..7 {
+            x[10_000 + k] = 0.92;
+            x[20_011 + k] = -0.94;
+        }
+        let mut g1 = NeedleGuard::new(16_000.0);
+        let one = g1.process(&x);
+        let mut g2 = NeedleGuard::new(16_000.0);
+        let mut chunked = Vec::new();
+        for c in x.chunks(3_840) {
+            chunked.extend(g2.process(c));
+        }
+        assert_eq!(one.len(), chunked.len());
+        let d = one
+            .iter()
+            .zip(&chunked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(d < 1e-7, "chunked/oneshot mismatch {d}");
+        assert_eq!(g1.repaired, 2);
+        assert_eq!(g2.repaired, 2);
+    }
+
+    #[test]
+    fn needle_straddling_chunk_boundary_is_repaired() {
+        let mut x = vowel(16_000);
+        // Needle right at a 3840-sample chunk edge.
+        for k in 0..7 {
+            x[3_837 + k] = 0.93;
+        }
+        let mut g = NeedleGuard::new(16_000.0);
+        let mut y = Vec::new();
+        for c in x.chunks(3_840) {
+            y.extend(g.process(c));
+        }
+        let d = g.latency();
+        let peak = y[3_837 + d - 16..3_844 + d + 16]
+            .iter()
+            .fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.3, "boundary needle survived: {peak}");
+        assert_eq!(g.repaired, 1);
+    }
+}

@@ -712,10 +712,16 @@ fn run_xvc_conversion(
     // warmup, pipeline fill); underruns there are not steady-state.
     const WARMUP_HOPS: u64 = 4;
 
+    // Needle suppressor on the decoder output (issue #42): the SAC
+    // decoder occasionally drives a ≲2.5 ms pulse into its final tanh —
+    // an order of magnitude above the local waveform, and the audible
+    // カチカチ of the field recordings. Repaired surgically at 16 kHz
+    // before pitch/BWE ever see it.
+    let mut needle_guard = vc_core::declick::NeedleGuard::new(SR as f32);
     // Forwards every finished hop to the output thread.
-    let drain = |stream: &mut xvc::XvcPipelinedStream,
-                 anchor: &mut Option<Instant>,
-                 emitted: &mut u64|
+    let mut drain = |stream: &mut xvc::XvcPipelinedStream,
+                     anchor: &mut Option<Instant>,
+                     emitted: &mut u64|
      -> anyhow::Result<()> {
         while let Some(step) = stream
             .try_next()
@@ -744,7 +750,12 @@ fn run_xvc_conversion(
                 }
             }
             *emitted += 1;
-            let _ = tx_out.send(OutMsg::Raw(step.samples));
+            let repaired_before = needle_guard.repaired;
+            let cleaned = needle_guard.process(&step.samples);
+            if needle_guard.repaired > repaired_before {
+                stats.lock().unwrap().declicks += needle_guard.repaired - repaired_before;
+            }
+            let _ = tx_out.send(OutMsg::Raw(cleaned));
         }
         Ok(())
     };
@@ -1083,22 +1094,7 @@ fn main() -> anyhow::Result<()> {
                     "converted",
                     &pulse_spec_out(),
                     None,
-                    // Jitter reserve: hold 300 ms queued before the sink
-                    // starts draining (and re-buffer the same amount after
-                    // an underrun). Without it the sink runs dry on any
-                    // transient stall shorter than the 240 ms `late`
-                    // threshold, and the server splices silence into the
-                    // monitor/virtual-mic — audible as ticks that are NOT
-                    // present in the samples we wrote (issue #42, fourth
-                    // field recording: discontinuities at quiet passages
-                    // that no in-process stage can produce).
-                    Some(&libpulse_binding::def::BufferAttr {
-                        maxlength: u32::MAX,
-                        tlength: OUT_SR as u32 * 4, // 1 s ceiling
-                        prebuf: OUT_SR as u32 * 4 * 3 / 10,
-                        minreq: u32::MAX,
-                        fragsize: u32::MAX,
-                    }),
+                    None,
                 )
                 .map_err(|e| anyhow::anyhow!("pulse playback: {e}"))?,
             )
