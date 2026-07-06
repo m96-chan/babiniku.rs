@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="assets/avatar.png" width="280" alt="babiniku avatar" />
-
-# babiniku.rs
+<img src="assets/header.png" width="100%" alt="babiniku.rs — a high-performance voice conversion library in Rust" />
 
 **Your avatar has a face. Now give it a voice.**
 
@@ -44,4 +42,4 @@ Every engine is ported weight-compatible and verified stage-by-stage against its
 
 ## License
 
-MIT OR Apache-2.0, at your option. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Avatar artwork: a personal modification of a model by [こまど (Komado)](https://drive.google.com/file/d/1DuVNYmahJTelmDbZ1RVXXKQ7wuYPYy3u/view) — shown for illustration only; all rights to the original model belong to its creator.
+MIT OR Apache-2.0, at your option. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Header/avatar artwork: a personal modification of a model by [こまど (Komado)](https://drive.google.com/file/d/1DuVNYmahJTelmDbZ1RVXXKQ7wuYPYy3u/view) — shown for illustration only; all rights to the original model belong to its creator.
