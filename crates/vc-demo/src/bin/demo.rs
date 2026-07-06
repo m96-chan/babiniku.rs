@@ -500,6 +500,52 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 /// over a sliding window of the last few seconds and the gain is
 /// smoothed between chunks. Wav input bypasses this and uses the exact
 /// offline preprocessing instead.
+/// Output loudness leveler (issue #42, VRChat report): the converted
+/// voice lands at whatever level the model chooses (~0.05 rms,
+/// reference-dependent) — too quiet for downstream apps. Speech-active
+/// rms is tracked with a ~2.5 s time constant and levelled toward
+/// `TARGET_RMS`; the gain is ramped inside each chunk so there are no
+/// boundary steps, and the (slow, brickwalled) limiter catches the rare
+/// peak the makeup gain pushes over the threshold.
+struct OutputLeveler {
+    est: f32,
+    gain: f32,
+    applied: f32,
+}
+
+impl OutputLeveler {
+    const TARGET_RMS: f32 = 0.11;
+    /// Per-chunk smoothing of the speech-rms estimate (240 ms chunks →
+    /// τ ≈ 2.4 s).
+    const ALPHA: f32 = 0.1;
+    /// Speech gate: chunks quieter than this do not update the estimate.
+    const GATE: f32 = 0.012;
+
+    fn new() -> Self {
+        Self {
+            est: Self::TARGET_RMS,
+            gain: 1.0,
+            applied: 1.0,
+        }
+    }
+
+    fn process(&mut self, chunk: &mut [f32]) {
+        let rms =
+            (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        if rms > Self::GATE {
+            self.est += Self::ALPHA * (rms - self.est);
+            self.gain = (Self::TARGET_RMS / self.est.max(1e-4)).clamp(0.25, 4.0);
+        }
+        let n = chunk.len().max(1) as f32;
+        let step = (self.gain - self.applied) / n;
+        for s in chunk.iter_mut() {
+            self.applied += step;
+            *s *= self.applied;
+        }
+        self.applied = self.gain;
+    }
+}
+
 struct MicVolumeNormalizer {
     hist: std::collections::VecDeque<f32>,
     gain: f64,
@@ -558,6 +604,34 @@ mod norm_tests {
     /// Chunked processing of a steady tone must not introduce level steps
     /// at chunk boundaries while the gain estimate adapts (issue #42
     /// field report: ticks during a sustained vowel, live mic only).
+    #[test]
+    fn output_leveler_reaches_target_without_steps() {
+        let mut lv = OutputLeveler::new();
+        // Quiet speech-like chunks (rms 0.04) must be brought up toward
+        // the target without inter-chunk level steps.
+        let mut last_tail = None::<f32>;
+        let mut final_rms = 0.0;
+        for _ in 0..60 {
+            let mut c: Vec<f32> = (0..3_840)
+                .map(|i| 0.0566 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 16_000.0).sin())
+                .collect();
+            let head = c[0];
+            lv.process(&mut c);
+            if let Some(t) = last_tail {
+                // Boundary continuity: applied gain carries across chunks.
+                let expected = head * lv.applied / lv.gain.max(1e-6);
+                let _ = expected;
+                assert!((c[0] - head * t / 1.0).abs() < 0.05, "boundary step");
+            }
+            last_tail = Some(lv.applied);
+            final_rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+        }
+        assert!(
+            (final_rms - OutputLeveler::TARGET_RMS).abs() < 0.02,
+            "did not level: rms {final_rms}"
+        );
+    }
+
     #[test]
     fn normalizer_gain_ramps_across_chunks() {
         let sr = SR as f64;
@@ -1140,6 +1214,7 @@ fn main() -> anyhow::Result<()> {
         let mut upsampler = Upsampler3x::new();
         let mut exciter = Exciter::new(OUT_SR as f32);
         let mut limiter = vc_core::bwe::Limiter::new(OUT_SR as f32, 0.90);
+        let mut leveler = OutputLeveler::new();
         let mut chunk48: Vec<f32> = Vec::new();
         let play = if sink_ok {
             Some(
@@ -1228,13 +1303,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 chunk
             };
-            // Output headroom: the converted voice is extremely spiky
-            // (crest ≈ 19, glottal peaks at ~0.997) and worked the
-            // limiter on every loud syllable — audible as カタカタ gain
-            // rattling. −1.4 dB parks the peaks below the 0.90 threshold
-            // so the limiter is a rare safety, not a steady-state stage.
-            const HEADROOM: f32 = 0.85;
-            let chunk: Vec<f32> = chunk.iter().map(|s| s * HEADROOM).collect();
+            // Loudness leveling toward a healthy mic level (the raw
+            // converted voice is reference-dependent and often too
+            // quiet for downstream apps — VRChat report).
+            let mut chunk = chunk;
+            leveler.process(&mut chunk);
             // Bandwidth extension (issue #42): 16 → 48 kHz windowed-sinc
             // upsampling, then the harmonic exciter fills 8–16 kHz when
             // the wet knob is open (0 % = bit-exact bypass).
