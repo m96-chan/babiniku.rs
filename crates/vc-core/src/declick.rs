@@ -60,6 +60,18 @@ const RATIO: f32 = 6.0;
 /// right after the input gate opens) cannot make every voiced sample
 /// look like an infinite-ratio needle.
 const MED_FLOOR: f32 = 0.012;
+/// Minimum context level for action on SMALL candidates: in
+/// near-silence the guard's false-positive class (breath/mouth/
+/// environment transients) is naked to the ear — even a 6 dB, 0.5 ms
+/// dip reads as a soft knock (ninth/tenth field reports) — while a
+/// small needle there is barely audible in the first place. The guard
+/// therefore acts only where the voice masks the repair…
+const VOICED_FLOOR: f32 = 0.018;
+/// …EXCEPT for loud needles: a pulse this big is clearly audible even
+/// against silence (live capture leaked a 0.9 needle in a quiet
+/// passage when the context gate was unconditional), and removing a
+/// loud pop from silence leaves nothing audible behind.
+const LOUD_NEEDLE: f32 = 0.25;
 /// Guard margin (gain-ramp length) around a detected run (samples at
 /// 16 kHz): 1 ms ramps — the ninth field report heard the earlier
 /// 0.5 ms ramps as a soft knock.
@@ -134,8 +146,9 @@ impl NeedleGuard {
                 i += 1;
                 continue;
             }
-            let med = self.local_median(i).max(MED_FLOOR);
-            if y <= RATIO * med {
+            let raw_med = self.local_median(i);
+            let med = raw_med.max(MED_FLOOR);
+            if (raw_med < VOICED_FLOOR && y < LOUD_NEEDLE) || y <= RATIO * med {
                 i += 1;
                 continue;
             }
@@ -251,10 +264,10 @@ mod tests {
     #[test]
     fn removes_small_needle_in_quiet_speech() {
         // Sixth field recording: needles scale down with the local
-        // signal — a 0.13 pulse over a 0.02-median passage still clicks.
-        let mut x: Vec<f32> = vowel(16_000).iter().map(|s| s * 0.25).collect();
+        // signal — a 0.2 pulse over a soft-voiced passage still clicks.
+        let mut x: Vec<f32> = vowel(16_000).iter().map(|s| s * 0.5).collect();
         for k in 0..5 {
-            x[8_000 + k] = 0.13;
+            x[8_000 + k] = 0.2;
         }
         let mut g = NeedleGuard::new(16_000.0);
         let y = g.process(&x);
@@ -262,8 +275,27 @@ mod tests {
         let peak = y[8_000 + d - 32..8_000 + d + 32]
             .iter()
             .fold(0f32, |m, s| m.max(s.abs()));
-        assert!(peak < 0.08, "small needle survived: local peak {peak}");
+        assert!(peak < 0.13, "small needle survived: local peak {peak}");
         assert_eq!(g.repaired, 1);
+    }
+
+    #[test]
+    fn silent_context_is_never_touched() {
+        // Tenth field report: repairs in near-silence are naked to the
+        // ear (soft keyboard-like knocks) while needles there are barely
+        // audible — below VOICED_FLOOR the guard must not act at all.
+        let mut x: Vec<f32> = vowel(16_000).iter().map(|s| s * 0.1).collect();
+        for k in 0..5 {
+            x[8_000 + k] = 0.12;
+        }
+        let expected = x.clone();
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        let d = g.latency();
+        assert_eq!(g.repaired, 0, "guard acted in near-silence");
+        for i in 7_900..8_100 {
+            assert_eq!(y[i + d], expected[i]);
+        }
     }
 
     #[test]
