@@ -63,6 +63,10 @@ struct Controls {
     pitch_decisemitones: AtomicI32,
     /// RNNoise dry/wet mix in percent (0 = off).
     denoise_mix: AtomicI32,
+    /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
+    /// voiced murmurs on silent input, so sub-threshold chunks bypass the
+    /// DiT and emit silence. i32::MIN disables.
+    gate_db: AtomicI32,
 }
 
 #[derive(Default)]
@@ -74,6 +78,7 @@ struct Stats {
     rtf_voc: f32,
     chunks: u64,
     late: u64,
+    gated: u64,
     passthrough: bool,
     status: String,
 }
@@ -86,6 +91,7 @@ struct Args {
     input_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
+    gate_db: i32,
     headless: bool,
     no_sink: bool,
     monitor: bool,
@@ -102,6 +108,7 @@ fn parse_args() -> Args {
         input_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
+        gate_db: -45,
         headless: false,
         no_sink: false,
         monitor: false,
@@ -124,6 +131,9 @@ fn parse_args() -> Args {
             }
             "--denoise-mix" => {
                 a.denoise_mix = it.next().and_then(|v| v.parse().ok()).expect("--denoise-mix <0-100>")
+            }
+            "--gate" => {
+                a.gate_db = it.next().and_then(|v| v.parse().ok()).expect("--gate <dBFS, e.g. -45>")
             }
             "--input-device" => a.input_device = Some(it.next().expect("--input-device <source>")),
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
@@ -386,6 +396,7 @@ fn main() -> anyhow::Result<()> {
     let controls = Arc::new(Controls {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        gate_db: AtomicI32::new(args.gate_db),
     });
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
@@ -567,6 +578,7 @@ fn main() -> anyhow::Result<()> {
     // --- conversion thread
     let stats_vc = stats.clone();
     let run_vc = run.clone();
+    let controls_vc = controls.clone();
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let fbank = KaldiFbank::new();
         // Incremental front end: raw-sample carry for the fbank framing and
@@ -577,12 +589,37 @@ fn main() -> anyhow::Result<()> {
         let mut kv = KvCache::default();
         let mut prev_mel: Option<Tensor> = None;
         let mut q = 0usize;
+        // Gate hangover: keep converting this many chunks after the level
+        // drops, so word tails are not clipped.
+        const HANGOVER: u32 = 2;
+        let mut open_for = 0u32;
         while run_vc.load(Ordering::Relaxed) {
             let Ok(chunk) = rx_in.recv_timeout(Duration::from_millis(300)) else {
                 continue;
             };
             let passthrough = stats_vc.lock().unwrap().passthrough;
             let in_level = rms(&chunk);
+            // Input energy gate: silence makes the DiT hallucinate voiced
+            // murmurs, so sub-threshold chunks emit silence directly (the
+            // CARD state freezes and resumes seamlessly on the next chunk).
+            let gate = controls_vc.gate_db.load(Ordering::Relaxed);
+            if !passthrough {
+                let db = 20.0 * in_level.max(1e-9).log10();
+                if db >= gate as f32 {
+                    open_for = HANGOVER + 1;
+                }
+                open_for = open_for.saturating_sub(1);
+                if open_for == 0 {
+                    let mut st = stats_vc.lock().unwrap();
+                    st.in_rms = in_level;
+                    st.out_rms = 0.0;
+                    st.chunks += 1;
+                    st.gated += 1;
+                    drop(st);
+                    let _ = tx_out.send(OutMsg::Raw(vec![0.0; CHUNK_SAMPLES]));
+                    continue;
+                }
+            }
             if passthrough {
                 // Drop the streaming state: the ASR caches must not carry
                 // context across the bypassed audio.
@@ -747,6 +784,7 @@ fn run_tui(
                 st.late,
                 st.passthrough,
                 st.status.clone(),
+                st.gated,
             )
         };
         terminal.draw(|f| {
@@ -796,17 +834,20 @@ fn run_tui(
             );
             let pitch = controls.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
+            let gate = controls.gate_db.load(Ordering::Relaxed);
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  asr {:.2} · vc {:.2} · vocoder {:.2}\nchunks {} · late {} · mode {}\npitch {:+.1} st ([ / ])   ·   denoise mix {}% (, / .)",
+                    "RTF  asr {:.2} · vc {:.2} · vocoder {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)",
                     snapshot.2,
                     snapshot.3,
                     snapshot.4,
                     snapshot.5,
                     snapshot.6,
+                    snapshot.9,
                     if snapshot.7 { "PASSTHROUGH" } else { "CONVERT" },
                     pitch,
                     mix,
+                    gate,
                 ))
                 .block(Block::default().borders(Borders::ALL).title(" pipeline ")),
                 rows[3],
@@ -855,6 +896,14 @@ fn run_tui(
                     KeyCode::Char('.') => {
                         let v = controls.denoise_mix.load(Ordering::Relaxed);
                         controls.denoise_mix.store((v + 10).min(100), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('-') => {
+                        let v = controls.gate_db.load(Ordering::Relaxed);
+                        controls.gate_db.store((v - 3).max(-90), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('=') => {
+                        let v = controls.gate_db.load(Ordering::Relaxed);
+                        controls.gate_db.store((v + 3).min(-10), Ordering::Relaxed);
                     }
                     _ => {}
                 }
