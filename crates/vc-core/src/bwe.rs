@@ -433,6 +433,62 @@ mod tests {
         assert!(rms(&added[..4_700]) < 1e-5);
     }
 
+    /// Chunked processing must equal one-shot processing exactly — any
+    /// difference means per-chunk state loss, i.e. periodic clicks at hop
+    /// boundaries in live use.
+    #[test]
+    fn chunked_equals_oneshot_through_full_chain() {
+        let sig: Vec<f32> = (0..48_000)
+            .map(|i| {
+                0.4 * (2.0 * PI * 4_500.0 * i as f32 / SR_OUT).sin()
+                    + 0.2 * (2.0 * PI * 6_300.0 * i as f32 / SR_OUT).sin()
+            })
+            .collect();
+        // Identical warm-up on both instances settles the wet ramp
+        // (prev_wet) and filter state before the comparison window.
+        let warm = &sig[..11_520];
+        let mut ex_a = Exciter::new(SR_OUT);
+        let mut w = warm.to_vec();
+        ex_a.process(&mut w, 0.6);
+        let mut a = sig[11_520..].to_vec();
+        ex_a.process(&mut a, 0.6);
+        let mut ex_b = Exciter::new(SR_OUT);
+        let mut w = warm.to_vec();
+        ex_b.process(&mut w, 0.6);
+        let mut b = sig[11_520..].to_vec();
+        for chunk in b.chunks_mut(11_520) {
+            ex_b.process(chunk, 0.6);
+        }
+        let d = a[11_520..]
+            .iter()
+            .zip(&b[11_520..])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(d < 1e-6, "chunk-boundary state loss: max diff {d}");
+
+        // Same for the upsampler.
+        let x16: Vec<f32> = (0..16_000)
+            .map(|i| 0.5 * (2.0 * PI * 3_000.0 * i as f32 / SR_IN).sin())
+            .collect();
+        let mut up1 = Upsampler3x::new();
+        let mut whole = Vec::new();
+        up1.process(&x16, &mut whole);
+        let mut up2 = Upsampler3x::new();
+        let mut parts = Vec::new();
+        for c in x16.chunks(3_840) {
+            let mut o = Vec::new();
+            up2.process(c, &mut o);
+            parts.extend(o);
+        }
+        let m = whole.len().min(parts.len());
+        let du = whole[..m]
+            .iter()
+            .zip(&parts[..m])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(du < 1e-6, "upsampler chunk-boundary loss: max diff {du}");
+    }
+
     /// Energy of `x` in the band `[lo, hi)` Hz via FFT.
     fn band_energy(x: &[f32], sr: f32, lo: f32, hi: f32) -> f32 {
         let n = x.len();

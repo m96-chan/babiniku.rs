@@ -1020,6 +1020,7 @@ fn main() -> anyhow::Result<()> {
         };
         let mut mel_tail: Option<Tensor> = None;
         let mut hold: Vec<f32> = Vec::new();
+        let mut last_out: f32 = 0.0;
         while run_out.load(Ordering::Relaxed) {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
@@ -1060,6 +1061,23 @@ fn main() -> anyhow::Result<()> {
                     out
                 }
             };
+            // Output declicker: gate/passthrough transitions splice
+            // unrelated audio (e.g. speech tail -> hard zeros), and the
+            // exciter makes the resulting step's broadband splash audible
+            // as a tick. Smooth any inter-chunk discontinuity over ~5 ms.
+            let mut chunk = chunk;
+            {
+                const DECLICK: usize = 80; // 5 ms at 16 kHz
+                let step = chunk.first().map_or(0.0, |&x0| x0 - last_out);
+                if step.abs() > 0.02 {
+                    for (i, s) in chunk.iter_mut().take(DECLICK).enumerate() {
+                        let w = i as f32 / DECLICK as f32;
+                        // Raised-cosine decay of the step offset (1 -> 0).
+                        *s -= step * (0.5 + 0.5 * (std::f32::consts::PI * w).cos());
+                    }
+                }
+                last_out = *chunk.last().unwrap_or(&last_out);
+            }
             // Post-vocoder pitch shift (Signalsmith Stretch), bypassed at 0
             // to avoid its internal latency.
             let semi = controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
