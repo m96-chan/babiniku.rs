@@ -144,7 +144,8 @@ let mut asr_state = asr.stream();               // incremental fbank/BNF decode
 let mut kv = KvCache::default();                // per-block CARD attention cache
 let mut prev_mel = None;
 for (q, samples_200ms) in mic_chunks.enumerate() {
-    let bnf = asr.forward_chunk(&fbank.compute(&samples_200ms, &device)?, &mut asr_state)?;
+    // Returns Some once a full 23-frame analysis window is buffered.
+    let Some(bnf) = asr.forward_chunk(&fbank.compute(&samples_200ms, &device)?, &mut asr_state)? else { continue };
     let cond = interpolate_linear(&bnf, 4)?;
     let timbre = model.timbre_cond(&cond, &prompt_mel, &voice_print)?;
     let noise = Tensor::randn(0f32, 1f32, (1, 20, 80), &device)?;
