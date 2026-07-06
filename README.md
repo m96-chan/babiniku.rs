@@ -16,7 +16,7 @@
 babiniku.rs is the missing last mile: a **real-time zero-shot voice changer toolkit in pure Rust**. Give it a few seconds of your character's voice, speak, and a **virtual microphone** delivers her voice to Discord, Zoom, OBS — anything with a mic picker. On a plain CPU. No Python, no CUDA Toolkit, no cloud: your voice never leaves your machine.
 
 ```sh
-cargo run --release -p vc-demo --features wavlm --bin meanvc-demo -- \
+cargo run --release -p vc-demo --features wavlm --bin babiniku-demo -- \
     --reference her_voice.wav --monitor --denoise
 ```
 
@@ -30,7 +30,7 @@ the table below). The TUI shows the active engine and its per-stage RTF.
 ## Use cases
 
 - **VTuber / streaming** — stay in character on stream, including impromptu collabs.
-- **Meetings & Discord as your avatar** — the mic named `MeanVC-Virtual-Mic` is just… you.
+- **Meetings & Discord as your avatar** — the mic named `Babiniku-Virtual-Mic` is just… you.
 - **Game voice chat** — squad hears the character, not the tired human at 2 a.m.
 - **Voice privacy** — speak publicly without publishing your real voice.
 
@@ -53,7 +53,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 |---|---|
 | [`crates/vc-core`](crates/vc-core) | Engine-agnostic foundation: encoder/speaker/vocoder traits, log-mel front-end, `Error`/`Result` |
 | [`crates/meanvc`](crates/meanvc) | MeanVC v1 + MeanVC 2 engines (library name `meanvc2`), examples, golden tests |
-| [`crates/vc-demo`](crates/vc-demo) | The `meanvc-demo` real-time TUI / virtual-mic binary |
+| [`crates/vc-demo`](crates/vc-demo) | The `babiniku-demo` real-time TUI / virtual-mic binary |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.

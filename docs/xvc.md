@@ -115,7 +115,7 @@ against the official implementation with skip-if-absent golden tests
 Usage:
 
 - offline: `cargo run --release -p xvc --example convert_xvc -- <source.wav> <reference.wav> <out.wav>`
-- live: `cargo run --release -p vc-demo --bin meanvc-demo -- --engine xvc --reference her_voice.wav`
+- live: `cargo run --release -p vc-demo --bin babiniku-demo -- --engine xvc --reference her_voice.wav`
 - weights: convert the official checkpoints once with
   `tools/convert_xvc_tokenizer.py`, `tools/convert_xvc_speaker.py`,
   `tools/convert_xvc_generator.py` →

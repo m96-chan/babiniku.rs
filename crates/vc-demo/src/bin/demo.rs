@@ -5,12 +5,12 @@
 //! `--engine xvc` (240 ms hop, 640 ms re-encoded window — the official
 //! X-VC CPU streaming preset)), and plays the result into a
 //! PulseAudio/PipeWire null sink whose remapped monitor shows up as a
-//! selectable **virtual microphone** (`meanvc_mic`) in other apps.
+//! selectable **virtual microphone** (`babiniku_mic`) in other apps.
 //!
 //! ```sh
-//! cargo run --release -p vc-demo --bin meanvc-demo -- \
+//! cargo run --release -p vc-demo --bin babiniku-demo -- \
 //!     --reference ckpt/test.wav --voice-print ckpt/voice_print_test.safetensors
-//! cargo run --release -p vc-demo --bin meanvc-demo -- \
+//! cargo run --release -p vc-demo --bin babiniku-demo -- \
 //!     --engine xvc --reference her_voice.wav
 //! ```
 //!
@@ -67,8 +67,8 @@ const MEL_TAIL: usize = 32; // vocoder left context, in mel frames (320 ms)
 /// end of the previous chunk; holding back FADE samples and cross-fading
 /// removes the phase discontinuity at the join.
 const FADE: usize = 160;
-const SINK: &str = "meanvc";
-const VIRT_MIC: &str = "meanvc_mic";
+const SINK: &str = "babiniku";
+const VIRT_MIC: &str = "babiniku_mic";
 
 /// Live-tunable knobs shared with the TUI thread.
 struct Controls {
@@ -231,18 +231,18 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
     let sink = load(&[
         "module-null-sink",
         &format!("sink_name={SINK}"),
-        "sink_properties=device.description=MeanVC-Output",
+        "sink_properties=device.description=Babiniku-Output",
     ])?;
     let mic = load(&[
         "module-remap-source",
         &format!("source_name={VIRT_MIC}"),
         &format!("master={SINK}.monitor"),
-        "source_properties=device.description=MeanVC-Virtual-Mic",
+        "source_properties=device.description=Babiniku-Virtual-Mic",
     ])?;
     Ok(vec![sink, mic])
 }
 
-const DENOISED_SRC: &str = "meanvc_denoised";
+const DENOISED_SRC: &str = "babiniku_denoised";
 
 /// In-process RNNoise at 16 kHz: exact x3 up/down resampling around the
 /// 48 kHz, 480-sample RNNoise frames (3200 in -> 20 frames -> 3200 out).
@@ -301,7 +301,7 @@ fn create_denoiser(master: Option<&str>) -> anyhow::Result<String> {
         "module-echo-cancel",
         &format!("source_name={DENOISED_SRC}"),
         "aec_method=webrtc",
-        "source_properties=device.description=MeanVC-Denoised-Input",
+        "source_properties=device.description=Babiniku-Denoised-Input",
     ]);
     if let Some(m) = master {
         cmd.arg(format!("source_master={m}"));
@@ -680,7 +680,7 @@ fn main() -> anyhow::Result<()> {
     let stats = Arc::new(Mutex::new(Stats {
         status: if sink_ok {
             format!(
-                "virtual mic \"{VIRT_MIC}\" is live — select \"MeanVC-Virtual-Mic\" in your app"
+                "virtual mic \"{VIRT_MIC}\" is live — select \"Babiniku-Virtual-Mic\" in your app"
             )
         } else {
             "virtual sink disabled (--no-sink)".into()
@@ -749,7 +749,7 @@ fn main() -> anyhow::Result<()> {
             None => {
                 let s = Simple::new(
                     None,
-                    "meanvc-demo",
+                    "babiniku-demo",
                     Direction::Record,
                     capture_device.as_deref(),
                     "capture",
@@ -788,7 +788,7 @@ fn main() -> anyhow::Result<()> {
             Some(
                 Simple::new(
                     None,
-                    "meanvc-demo",
+                    "babiniku-demo",
                     Direction::Playback,
                     Some(SINK),
                     "converted",

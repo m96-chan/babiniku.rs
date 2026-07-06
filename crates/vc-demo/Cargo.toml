@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "meanvc-demo"
+name = "babiniku-demo"
 path = "src/bin/demo.rs"
 
 [dependencies]
