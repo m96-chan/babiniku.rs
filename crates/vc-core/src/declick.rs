@@ -22,8 +22,11 @@
 //! - only contiguous runs up to 2.5 ms are repaired; anything longer is
 //!   real audio by definition and is left alone.
 //!
-//! Repair bridges the run (plus a small guard margin) with linear
-//! interpolation — over ≲3 ms this is inaudible in voiced speech.
+//! Repair ATTENUATES the run to the local level with a tapered gain
+//! dip (the eighth field recording pinned audible ticks to the earlier
+//! linear-bridge repair: excising through quiet breathy content leaves
+//! a notch that is itself a tick; a gain dip keeps the waveform
+//! continuous, and a false positive merely softens a transient).
 //!
 //! The suppressor is streaming: [`NeedleGuard::process`] consumes a
 //! chunk and returns the same number of samples delayed by the context

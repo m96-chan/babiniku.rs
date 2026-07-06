@@ -763,11 +763,16 @@ fn run_xvc_conversion(
     // warmup, pipeline fill); underruns there are not steady-state.
     const WARMUP_HOPS: u64 = 4;
 
-    // Needle suppressor on the decoder output (issue #42): the SAC
-    // decoder occasionally drives a ≲2.5 ms pulse into its final tanh —
-    // an order of magnitude above the local waveform, and the audible
-    // カチカチ of the field recordings. Repaired surgically at 16 kHz
-    // before pitch/BWE ever see it.
+    // Needle suppressor on the decoder output (issue #42). The eighth
+    // field recording pinned the audible ticks to the guard's earlier
+    // linear-bridge repair (excision through quiet breathy content
+    // leaves a notch that is itself a tick); the repair is now a
+    // tapered gain dip, so a real needle is attenuated into a normal
+    // sample and a false positive merely softens a transient. The guard
+    // stays in the default path because cross-check structurally cannot
+    // catch needles inside high-divergence windows (the run merges into
+    // long divergence and is rejected as real audio) — which is exactly
+    // where needles are most frequent.
     let mut needle_guard = vc_core::declick::NeedleGuard::new(SR as f32);
     // Forwards every finished hop to the output thread.
     let mut drain = |stream: &mut xvc::XvcPipelinedStream,
