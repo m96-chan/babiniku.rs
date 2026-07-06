@@ -659,17 +659,28 @@ enum StageMsg<T> {
 }
 
 /// The pipelined streaming driver (issue #38): the same stateless-window
-/// stream as [`XvcStream`], but with the three stages of
-/// [`XvcEngine::forward_window`] — semantic (mel + tokenizer + adapter),
-/// acoustic (codec encode + prenet + converter) and decode (waveform
-/// synthesis) — running on three dedicated threads connected by bounded
-/// channels, so consecutive windows overlap. Throughput becomes
-/// `max(stage)` instead of `sum(stages)` at the cost of up to two extra
-/// hops of latency while the pipeline is full.
+/// stream as [`XvcStream`], but asynchronous behind channels.
+///
+/// On **CPU** the three stages of [`XvcEngine::forward_window`] —
+/// semantic (mel, tokenizer, adapter), acoustic (codec encode, prenet,
+/// converter) and decode (waveform synthesis) — run on three dedicated
+/// threads connected by bounded channels, so consecutive windows overlap.
+/// Throughput becomes `max(stage)` instead of `sum(stages)` at the cost
+/// of up to two extra hops of latency while the pipeline is full.
+///
+/// On **accelerator devices** (CUDA/Metal) the whole forward runs on a
+/// single worker thread instead: device kernels serialize on one stream
+/// anyway so stage overlap buys nothing, and concurrent op submission
+/// from several host threads is not safe in candle — measured on CUDA it
+/// corrupted the audio non-deterministically (host-side locking around
+/// the forwards is not enough, because kernel launches are asynchronous
+/// and mutex order does not imply stream order for the tensors crossing
+/// threads).
 ///
 /// Every window runs exactly the ops of the sequential driver in the same
 /// order, so the output is **bit-identical** to [`XvcStream`]
-/// (`tests/golden_pipeline.rs::pipelined_stream_matches_sequential`).
+/// (`tests/golden_pipeline.rs::pipelined_stream_matches_sequential` on
+/// CPU, `examples/bench_stages.rs` on CUDA).
 ///
 /// [`XvcPipelinedStream::push`] input samples (ready windows are enqueued
 /// automatically), drain finished hops with
@@ -699,6 +710,52 @@ impl XvcPipelinedStream {
         let windower = Windower::new(cfg)?;
 
         let (tx_job, rx_job) = sync_channel::<StageMsg<Vec<f32>>>(Self::STAGE_QUEUE);
+
+        // Accelerator devices: single worker thread (see the type docs —
+        // multi-thread op submission is unsafe in candle, and stage
+        // overlap buys nothing when kernels serialize on one stream).
+        if !matches!(engine.device(), Device::Cpu) {
+            let (tx_step, rx_step) = channel::<Result<StreamStep>>();
+            let worker = std::thread::Builder::new()
+                .name("xvc-window".into())
+                .spawn(move || {
+                    let mut fader = Crossfader::new(cfg.smooth_len());
+                    while let Ok(msg) = rx_job.recv() {
+                        let out = match msg {
+                            StageMsg::Silent { index } => {
+                                let mut out = vec![0f32; cfg.current_len()];
+                                fader.apply(index, &mut out, vec![0.0; cfg.smooth_len()]);
+                                Ok(StreamStep {
+                                    samples: out,
+                                    timings: StageTimings::default(),
+                                })
+                            }
+                            StageMsg::Work { index, payload, .. } => {
+                                engine.forward_window(&payload, &reference).and_then(|fwd| {
+                                    let (mut out, tail) = slice_window_wav(&fwd.wav, &cfg)?;
+                                    fader.apply(index, &mut out, tail);
+                                    Ok(StreamStep {
+                                        samples: out,
+                                        timings: fwd.timings,
+                                    })
+                                })
+                            }
+                        };
+                        let failed = out.is_err();
+                        if tx_step.send(out).is_err() || failed {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|e| Error::Input(format!("cannot spawn the xvc worker: {e}")))?;
+            return Ok(Self {
+                windower,
+                tx_job: Some(tx_job),
+                rx_step,
+                received: 0,
+                handles: vec![worker],
+            });
+        }
         let (tx_sem, rx_sem) =
             sync_channel::<Result<StageMsg<(Vec<f32>, Tensor)>>>(Self::STAGE_QUEUE);
         let (tx_acu, rx_acu) = sync_channel::<Result<StageMsg<Tensor>>>(Self::STAGE_QUEUE);
