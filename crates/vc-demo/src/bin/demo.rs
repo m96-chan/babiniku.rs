@@ -150,6 +150,9 @@ struct Stats {
     declicks: u64,
     passthrough: bool,
     status: String,
+    /// Engine configuration summary shown in the TUI footer (window
+    /// size / cross-check), set once by the conversion thread.
+    engine_info: String,
 }
 
 struct Args {
@@ -168,6 +171,11 @@ struct Args {
     /// Disable the cross-window needle check (saves one hop = 240 ms of
     /// latency, at the cost of occasional decoder needle ticks).
     low_latency: bool,
+    /// X-VC re-encode window override (ms, multiple of 80). Larger
+    /// windows produce fewer decoder needles at more compute per hop;
+    /// latency is unaffected (only the history part grows). Default:
+    /// 2400 (the official GPU preset) on CUDA, 640 on CPU.
+    window_ms: Option<usize>,
     monitor: bool,
     denoise: bool,
     duration: Option<f32>,
@@ -190,6 +198,7 @@ fn parse_args() -> Args {
         headless: false,
         no_sink: false,
         low_latency: false,
+        window_ms: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -216,6 +225,14 @@ fn parse_args() -> Args {
             "--out" => a.out = Some(it.next().expect("--out <file>")),
             "--headless" => a.headless = true,
             "--low-latency" => a.low_latency = true,
+            "--window-ms" => {
+                a.window_ms = Some(
+                    it.next()
+                        .expect("--window-ms <ms>")
+                        .parse()
+                        .expect("--window-ms takes an integer"),
+                )
+            }
             "--cpu" => a.cpu = true,
             "--no-sink" => a.no_sink = true,
             "--monitor" => a.monitor = true,
@@ -698,15 +715,33 @@ fn run_xvc_conversion(
     run: Arc<AtomicBool>,
     controls: Arc<Controls>,
     cross_check: bool,
+    window_ms: usize,
 ) -> anyhow::Result<()> {
     // Cross-window needle suppression is on unless --low-latency: it
     // holds each hop until the next window has re-rendered the same
     // region (+240 ms), which is what finally kills the decoder needle
     // ticks that amplitude heuristics can only chase (issue #42).
+    //
+    // The window defaults to 2400 ms on CUDA (the official GPU preset):
+    // measured needle rate drops ~3-4x vs the 640 ms CPU preset, worst
+    // per-hop forward stays ~43 ms against the 240 ms deadline, and the
+    // enlargement is all history, so latency is unchanged (pinned by
+    // `longer_window_does_not_add_latency`). CPU keeps 640 ms — it
+    // cannot absorb the compute — and leans on cross_check instead.
     let cfg = xvc::StreamConfig {
+        chunk_ms: window_ms,
         cross_check,
         ..Default::default()
     };
+    stats.lock().unwrap().engine_info = format!(
+        "window {window_ms} ms{}{}",
+        if cross_check { " · xcheck" } else { "" },
+        if window_ms <= 640 {
+            " (short window: more needles — try --window-ms 1280+ if compute allows)"
+        } else {
+            ""
+        },
+    );
     let hop = cfg.current_ms as f32 / 1000.0;
     let mut stream = xvc::XvcPipelinedStream::new(engine.clone(), reference.clone(), cfg)?;
     let mut hp = HighpassBiquad::new(SR as f64, 40.0);
@@ -1214,6 +1249,16 @@ fn main() -> anyhow::Result<()> {
     let run_vc = run.clone();
     let controls_vc = controls.clone();
     let xvc_cross_check = !args.low_latency;
+    // Window default per device (issue #42 knee search): CUDA absorbs
+    // the official 2400 ms window (~4x fewer decoder needles, worst hop
+    // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
+    let xvc_window_ms = args.window_ms.unwrap_or_else(|| {
+        if matches!(xvc_device(args.cpu), Device::Cpu) {
+            640
+        } else {
+            2_400
+        }
+    });
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
             Models::Xvc {
@@ -1230,6 +1275,7 @@ fn main() -> anyhow::Result<()> {
                     run_vc,
                     controls_vc,
                     xvc_cross_check,
+                    xvc_window_ms,
                 );
             }
             Models::MeanVc {
@@ -1457,6 +1503,7 @@ fn run_tui(
                 st.passthrough,
                 st.status.clone(),
                 st.gated,
+                st.engine_info.clone(),
             )
         };
         terminal.draw(|f| {
@@ -1511,7 +1558,7 @@ fn run_tui(
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1526,6 +1573,11 @@ fn run_tui(
                     mix,
                     gate,
                     bwe,
+                    if snapshot.10.is_empty() {
+                        "engine defaults"
+                    } else {
+                        snapshot.10.as_str()
+                    },
                 ))
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     " pipeline — engine {} ",

@@ -384,6 +384,16 @@ impl StreamConfig {
         Self::samples(self.history_ms())
     }
 
+    /// Algorithmic latency in milliseconds: a hop becomes ready
+    /// `smooth + future` ms after its `current` span has been pushed,
+    /// plus the `current` ms of input accumulation itself. NOTE: the
+    /// window size (`chunk_ms`) does NOT appear here — growing the
+    /// window only grows `history` (= compute per hop), never the
+    /// latency. `longer_window_does_not_add_latency` pins this.
+    pub fn algorithmic_latency_ms(&self) -> usize {
+        self.current_ms + self.smooth_ms + self.future_ms
+    }
+
     fn validate(&self) -> Result<()> {
         if self.current_ms == 0 {
             return Err(Error::Input("current_ms must be > 0".into()));
@@ -1172,6 +1182,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn longer_window_does_not_add_latency() {
+        // Issue #42: the CUDA default enlarges the window to shed
+        // decoder needles. The enlargement must land entirely in the
+        // HISTORY part — if a refactor ever grows future/smooth/current
+        // along with the window, latency silently increases and this
+        // fails.
+        let base = StreamConfig::default();
+        for chunk_ms in [640, 960, 1280, 1920, 2400] {
+            let cfg = StreamConfig {
+                chunk_ms,
+                ..Default::default()
+            };
+            cfg.validate().unwrap();
+            assert_eq!(cfg.current_ms, base.current_ms);
+            assert_eq!(cfg.smooth_ms, base.smooth_ms);
+            assert_eq!(cfg.future_ms, base.future_ms);
+            assert_eq!(
+                cfg.algorithmic_latency_ms(),
+                base.algorithmic_latency_ms(),
+                "window {chunk_ms} ms changed the algorithmic latency"
+            );
+            assert_eq!(
+                cfg.history_ms(),
+                chunk_ms - base.algorithmic_latency_ms(),
+                "window growth must go entirely into history"
+            );
+        }
+    }
+
+    #[test]
     fn cross_check_repairs_sharp_lone_run() {
         // Two renderings of the same vowel: slightly different (phase
         // drift), but the held one carries a decoder needle.
@@ -1207,6 +1247,39 @@ mod tests {
         let mut checked = held.clone();
         let repairs = cross_check_repair(&mut checked, &other);
         assert_eq!(repairs, 0);
+        assert_eq!(checked, held);
+    }
+
+    #[test]
+    fn cross_check_keeps_genuine_plosives() {
+        // A real transient (plosive burst / attack) appears in BOTH
+        // renderings — sharp in both, so the sharpness-asymmetry gate
+        // must leave it bit-untouched even though it is short and the
+        // renderings differ slightly.
+        let n = 3_840;
+        let f = 300.0 / SAMPLE_RATE as f32;
+        let burst = |i: usize, k0: usize, amp: f32| -> f32 {
+            let d = i as f32 - k0 as f32;
+            if (0.0..24.0).contains(&d) {
+                amp * (0.7 * d).sin() * (1.0 - d / 24.0)
+            } else {
+                0.0
+            }
+        };
+        let held: Vec<f32> = (0..n)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * f * i as f32).sin() + burst(i, 2_000, 0.5))
+            .collect();
+        // The other rendering: slightly different level and a 2-sample
+        // shifted burst (window re-render jitter).
+        let other: Vec<f32> = (0..n)
+            .map(|i| {
+                0.19 * (2.0 * std::f32::consts::PI * f * (i as f32 + 2.0)).sin()
+                    + burst(i, 2_002, 0.47)
+            })
+            .collect();
+        let mut checked = held.clone();
+        let repairs = cross_check_repair(&mut checked, &other);
+        assert_eq!(repairs, 0, "genuine plosive was repaired away");
         assert_eq!(checked, held);
     }
 

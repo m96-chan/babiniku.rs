@@ -257,6 +257,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_genuine_plosive_attack() {
+        // A plosive: near-instant attack followed by a sustained burst.
+        // Longer than any needle (> 2.5 ms) and not isolated — must be
+        // bit-untouched even at high amplitude over a quiet context.
+        let mut x = vec![0.001f32; 16_000];
+        for k in 0..160 {
+            // 10 ms decaying burst at 4 kHz over near-silence.
+            let t = k as f32;
+            x[8_000 + k] = 0.6 * (1.571 * t).sin() * (-t / 80.0).exp();
+        }
+        let expected = x.clone();
+        let mut g = NeedleGuard::new(16_000.0);
+        let y = g.process(&x);
+        let d = g.latency();
+        assert_eq!(g.repaired, 0, "plosive attack was repaired");
+        for i in 7_900..8_300 {
+            assert_eq!(y[i + d], expected[i], "plosive modified at {i}");
+        }
+    }
+
+    #[test]
     fn chunked_equals_oneshot() {
         let mut x = vowel(32_000);
         for k in 0..7 {
