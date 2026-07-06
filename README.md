@@ -66,6 +66,8 @@ cargo build --release --features cuda   # or --features metal
 
 ## Quick start
 
+The APIs below are the **MeanVC 2** interfaces and run with random weights until the official v2 release; for conversion that works today with the released **v1** checkpoints, see [MeanVC v1 usage](#meanvc-v1-usage) below and the [TUI demo](#real-time-tui-demo-with-a-virtual-microphone-linux).
+
 ### Offline (full-utterance) conversion
 
 ```rust
@@ -118,6 +120,41 @@ out.loss.backward()?;
 ```
 
 The JVP inside the mean-flows target is computed **exactly** with forward-mode AD (`candle_core::forward_ad::jvp`, added on the candle fork's `feat/forward-ad-jvp` branch). `JvpMode::FiniteDifference(delta)` is kept for cross-checking.
+
+## MeanVC v1 usage
+
+Offline (full utterance):
+
+```rust
+use meanvc2::v1::{MeanVc1, MeanVc1Config};
+
+let model = MeanVc1::load(MeanVc1Config::default(), "ckpt/model_200ms.safetensors", &device)?;
+let timbre_src = model.timbre_cond(&bnf, &prompt_mel, &voice_print)?; // MRTE
+let mel = model.sample(&bnf, &prompt_mel, &voice_print)?; // chunked CARD, 1-NFE
+```
+
+Online (chunk-by-chunk streaming, the path the TUI demo uses):
+
+```rust
+use meanvc2::v1::{KvCache, MelV1, KaldiFbank, interpolate_linear};
+use meanvc2::backends::{FastU2pp, FastU2ppConfig};
+
+let asr = FastU2pp::load(FastU2ppConfig::official_meanvc1(), "ckpt/fastu2pp.safetensors", &device)?;
+let mut asr_state = asr.stream();               // incremental fbank/BNF decode
+let mut kv = KvCache::default();                // per-block CARD attention cache
+let mut prev_mel = None;
+for (q, samples_200ms) in mic_chunks.enumerate() {
+    let bnf = asr.forward_chunk(&fbank.compute(&samples_200ms, &device)?, &mut asr_state)?;
+    let cond = interpolate_linear(&bnf, 4)?;
+    let timbre = model.timbre_cond(&cond, &prompt_mel, &voice_print)?;
+    let noise = Tensor::randn(0f32, 1f32, (1, 20, 80), &device)?;
+    let u = model.forward_stream(&noise, &timbre, &voice_print, prev_mel.as_ref(), q * 20, &mut kv)?;
+    let mel = (noise - u)?;                      // -> Vocos ((mel+1)/2) -> 200 ms of audio
+    prev_mel = Some(mel);
+}
+```
+
+See `src/bin/demo.rs` for the complete real-time loop (gating, denoising, pitch shift, virtual mic) and `examples/convert_v1.rs` for the offline pipeline.
 
 ## Real-time TUI demo with a virtual microphone (Linux)
 
