@@ -60,8 +60,10 @@ const RATIO: f32 = 6.0;
 /// right after the input gate opens) cannot make every voiced sample
 /// look like an infinite-ratio needle.
 const MED_FLOOR: f32 = 0.012;
-/// Guard margin repaired around a detected run (samples).
-const MARGIN: usize = 8;
+/// Guard margin (gain-ramp length) around a detected run (samples at
+/// 16 kHz): 1 ms ramps — the ninth field report heard the earlier
+/// 0.5 ms ramps as a soft knock.
+const MARGIN: usize = 16;
 /// Isolation context checked on both sides of a run (seconds): a needle
 /// is a lone pulse, so its neighbourhood stays well below the run peak.
 /// Speech onsets fail this check — the next glottal cycle follows at a
@@ -76,7 +78,12 @@ impl NeedleGuard {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             ctx: (0.008 * sample_rate) as usize,
-            max_run: (0.0025 * sample_rate) as usize,
+            // Action is restricted to needle-width runs (≤ 0.5 ms): the
+            // decoder needle is a 3–5 sample pulse at 16 kHz, while
+            // breath/consonant transients — the guard's false-positive
+            // class in quiet passages, audible as soft knocks when
+            // touched — are broader and now pass untouched.
+            max_run: (0.0005 * sample_rate) as usize,
             iso: (ISO_SECS * sample_rate) as usize,
             buf: Vec::new(),
             repaired: 0,
