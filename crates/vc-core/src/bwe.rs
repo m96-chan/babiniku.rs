@@ -306,6 +306,12 @@ pub struct Exciter {
     harm_hp: FirHighpass,
     src_env: EnvFollower,
     harm_env: EnvFollower,
+    /// One-pole smoothed envelope-matching gain (prevents the ×MAX_GAIN
+    /// burst at speech onsets, where the harmonic envelope is still ~0).
+    gain_state: f32,
+    gain_alpha: f32,
+    /// Previous chunk's wet amount; knob changes ramp across the chunk.
+    prev_wet: f32,
 }
 
 impl Exciter {
@@ -326,6 +332,10 @@ impl Exciter {
             harm_hp: FirHighpass::new(sample_rate, 8_050.0, 241, 7.857),
             src_env: EnvFollower::new(sample_rate, 0.005, 0.050),
             harm_env: EnvFollower::new(sample_rate, 0.005, 0.050),
+            gain_state: 0.0,
+            // ~10 ms time constant at the processing rate.
+            gain_alpha: 1.0 - (-1.0 / (0.010 * sample_rate)).exp(),
+            prev_wet: 0.0,
         }
     }
 
@@ -334,8 +344,12 @@ impl Exciter {
     /// state still advances so live knob changes are transient-free).
     pub fn process(&mut self, samples: &mut [f32], wet: f32) {
         let wet = wet.clamp(0.0, 1.0);
+        let n = samples.len().max(1) as f32;
+        let wet_step = (wet - self.prev_wet) / n;
+        let mut wet_now = self.prev_wet;
         for s in samples.iter_mut() {
             let x = *s;
+            wet_now += wet_step;
             // Source band 3–8 kHz.
             let band = self.band_lp.tick(self.band_hp.tick(x));
             // Full-wave rectification: even harmonics + DC/baseband,
@@ -347,11 +361,18 @@ impl Exciter {
             // tracks the source band at TARGET_RATIO.
             let se = self.src_env.tick(band);
             let he = self.harm_env.tick(harm);
-            let gain = (se / (he + 1e-9)).min(Self::MAX_GAIN);
-            if wet > 0.0 {
-                *s = x + wet * Self::TARGET_RATIO * gain * harm;
+            // Silence guard: fade the wet branch out below −54 dBFS source
+            // level instead of amplifying the noise floor at word onsets.
+            let guard = (se / 2e-3).clamp(0.0, 1.0);
+            let target = (se / (he + 1e-9)).min(Self::MAX_GAIN) * guard;
+            // Slew-limit the gain (~10 ms) so onsets cannot inject a
+            // full-scale harmonic burst in a single sample ("プツプツ").
+            self.gain_state += self.gain_alpha * (target - self.gain_state);
+            if wet_now > 0.0 {
+                *s = x + wet_now * Self::TARGET_RATIO * self.gain_state * harm;
             }
         }
+        self.prev_wet = wet;
     }
 }
 
@@ -386,6 +407,30 @@ mod tests {
             im += w * s as f64 * ph.sin();
         }
         ((re * re + im * im).sqrt() * 2.0 / n as f64) as f32
+    }
+
+    /// Word-onset regression (issue #42 field report): silence followed by
+    /// a burst must not inject a one-sample harmonic spike — the smoothed
+    /// gain has ~10 ms to rise, so the wet output may not jump faster than
+    /// the dry input by more than a small factor.
+    #[test]
+    fn exciter_onset_produces_no_click() {
+        let mut ex = Exciter::new(SR_OUT);
+        let mut sig = vec![0.0f32; 4_800]; // 100 ms silence
+        sig.extend(sine(5_000.0, SR_OUT, 9_600, 0.6)); // sudden voiced burst
+        let dry = sig.clone();
+        ex.process(&mut sig, 1.0);
+        let added: Vec<f32> = sig.iter().zip(&dry).map(|(w, d)| w - d).collect();
+        // Added high band within the first 2 ms of the onset stays small
+        // relative to its steady-state level.
+        let onset = rms(&added[4_800..4_896]);
+        let steady = rms(&added[9_600..14_000]);
+        assert!(
+            onset < 0.35 * steady + 1e-6,
+            "onset burst: {onset} vs steady {steady}"
+        );
+        // And in pure silence the wet branch adds nothing audible.
+        assert!(rms(&added[..4_700]) < 1e-5);
     }
 
     /// Energy of `x` in the band `[lo, hi)` Hz via FFT.
