@@ -10,6 +10,9 @@
 //!
 //! Implemented stages (each golden-tested against the official
 //! implementation, see `tests/`):
+//! * [`preprocess`] — volume norm / 40 Hz high-pass / Whisper 128-mel
+//! * [`tokenizer`] — GLM-4-Voice tokenizer (truncated Whisper-large-v3
+//!   encoder + VQ) and the 12.5→50 Hz semantic adapter
 //! * [`speaker`] — frozen ERes2Net speaker encoder (Kaldi fbank-80 →
 //!   192-d utterance embedding)
 //! * [`codec`] — SAC acoustic codec (DAC-style encoder/decoder, FVQ)
@@ -17,7 +20,9 @@
 
 pub mod codec;
 pub mod converter;
+pub mod preprocess;
 pub mod speaker;
+pub mod tokenizer;
 
 pub use codec::{SacCodec, SacCodecConfig, SacEncodeOutput};
 pub use converter::{AcousticConverter, AcousticConverterConfig};
