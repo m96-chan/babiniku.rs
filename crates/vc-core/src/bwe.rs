@@ -391,6 +391,88 @@ impl Exciter {
     }
 }
 
+/// Look-ahead peak limiter: keeps the output under `threshold` without
+/// hard-clipping (hard clips read as "kachi-kachi" ticks — issue #42
+/// field analysis found every reported tick coincided with |y| > 0.97).
+///
+/// A `lookahead`-sample delay line lets the gain reach any upcoming peak
+/// before it plays: the gain envelope takes the minimum required gain
+/// over the look-ahead window (sliding-minimum via a monotonic deque),
+/// then releases exponentially (~80 ms). Below threshold it is exactly
+/// unity — bit-transparent.
+pub struct Limiter {
+    threshold: f32,
+    delay: std::collections::VecDeque<f32>,
+    lookahead: usize,
+    /// (index, required_gain) monotonic deque for the sliding minimum.
+    window: std::collections::VecDeque<(u64, f32)>,
+    pos: u64,
+    gain: f32,
+    attack: f32,
+    release: f32,
+}
+
+impl Limiter {
+    pub fn new(sample_rate: f32, threshold: f32) -> Self {
+        let lookahead = (sample_rate * 0.0025) as usize; // 2.5 ms
+        Self {
+            threshold,
+            delay: std::collections::VecDeque::from(vec![0.0; lookahead]),
+            lookahead,
+            window: std::collections::VecDeque::new(),
+            pos: 0,
+            gain: 1.0,
+            // ~0.4 ms attack: >=6 time constants inside the 2.5 ms
+            // look-ahead, so the gain is settled before the peak plays.
+            attack: 1.0 - (-1.0 / (0.0004 * sample_rate)).exp(),
+            release: 1.0 - (-1.0 / (0.080 * sample_rate)).exp(),
+        }
+    }
+
+    /// Delay introduced by the look-ahead, in samples.
+    pub fn latency(&self) -> usize {
+        self.lookahead
+    }
+
+    pub fn process(&mut self, samples: &mut [f32]) {
+        for s in samples.iter_mut() {
+            let x = *s;
+            // Required gain for the incoming sample.
+            let need = if x.abs() > self.threshold {
+                self.threshold / x.abs()
+            } else {
+                1.0
+            };
+            // Sliding minimum over the look-ahead window.
+            while let Some(&(_, g)) = self.window.back() {
+                if g >= need {
+                    self.window.pop_back();
+                } else {
+                    break;
+                }
+            }
+            self.window.push_back((self.pos, need));
+            while let Some(&(i, _)) = self.window.front() {
+                if i + self.lookahead as u64 <= self.pos {
+                    self.window.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let target = self.window.front().map_or(1.0, |&(_, g)| g);
+            // Attack: move to the (lower) target immediately — the peak is
+            // still `lookahead` samples away, so this is a 2.5 ms ramp by
+            // construction. Release: exponential.
+            let coeff = if target < self.gain { self.attack } else { self.release };
+            self.gain += coeff * (target - self.gain);
+            self.delay.push_back(x);
+            let out = self.delay.pop_front().unwrap_or(0.0);
+            *s = out * self.gain;
+            self.pos += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +627,38 @@ mod tests {
         let med = sorted[sorted.len() / 2] + 1e-9;
         let crest = env.iter().fold(0f32, |m, &v| m.max(v)) / med;
         assert!(crest < 4.0, "high-band click crest factor {crest}");
+    }
+
+    #[test]
+    fn limiter_is_transparent_below_threshold() {
+        let mut l = Limiter::new(SR_OUT, 0.9);
+        let sig = sine(440.0, SR_OUT, 9_600, 0.5);
+        let mut out = sig.clone();
+        l.process(&mut out);
+        // Compare with the look-ahead delay compensated.
+        let d = l.latency();
+        let diff = out[d..]
+            .iter()
+            .zip(&sig[..sig.len() - d])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(diff < 1e-6, "not transparent: {diff}");
+    }
+
+    #[test]
+    fn limiter_prevents_clipping_without_steps() {
+        let mut l = Limiter::new(SR_OUT, 0.9);
+        // 0.5 sine with a 1.4x burst in the middle.
+        let mut sig = sine(300.0, SR_OUT, 48_000, 0.5);
+        for s in sig[16_000..20_000].iter_mut() {
+            *s *= 2.8;
+        }
+        l.process(&mut sig);
+        let peak = sig.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        assert!(peak <= 0.905, "peak {peak}");
+        // Smooth gain: no added discontinuities.
+        let dmax = sig.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(dmax < 0.06, "step in limited output: {dmax}");
     }
 
     /// Energy of `x` in the band `[lo, hi)` Hz via FFT.

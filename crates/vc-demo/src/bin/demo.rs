@@ -1057,6 +1057,7 @@ fn main() -> anyhow::Result<()> {
         // plus the optional harmonic exciter, after the pitch shifter.
         let mut upsampler = Upsampler3x::new();
         let mut exciter = Exciter::new(OUT_SR as f32);
+        let mut limiter = vc_core::bwe::Limiter::new(OUT_SR as f32, 0.90);
         let mut chunk48: Vec<f32> = Vec::new();
         let play = if sink_ok {
             Some(
@@ -1152,6 +1153,7 @@ fn main() -> anyhow::Result<()> {
             upsampler.process(&chunk, &mut chunk48);
             let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
             exciter.process(&mut chunk48, wet);
+            limiter.process(&mut chunk48);
             if let Some(p) = &play {
                 let bytes: Vec<u8> = chunk48.iter().flat_map(|s| s.to_ne_bytes()).collect();
                 p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
