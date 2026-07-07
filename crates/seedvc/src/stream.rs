@@ -30,6 +30,13 @@ pub struct StreamConfig {
     pub dit_context: usize,
     /// Crossfade at block joins, in 22 050 Hz samples (~40 ms).
     pub crossfade_22k: usize,
+    /// SOLA search range (22 050 Hz samples, ~10 ms like the official
+    /// GUI's `sola_search_frame`): each block's render is spliced at
+    /// the offset that best phase-aligns with the previous tail —
+    /// adjacent diffusion renders agree in envelope but not in phase,
+    /// and a plain crossfade of misaligned phase reads as a soft knock
+    /// at the block rate (かっかっかっ, field report).
+    pub sola_search_22k: usize,
     /// CFM steps / cfg rate. 6 steps live (offline default 10): 8 left
     /// only ~22 % headroom on CUDA and desktop GPU contention pushed
     /// hops over the block budget; 6 gives ~40 %.
@@ -48,6 +55,7 @@ impl Default for StreamConfig {
             context: 40_000,
             dit_context: 8_000,
             crossfade_22k: 882,
+            sola_search_22k: 220,
             steps: 6,
             cfg_rate: 0.7,
             max_prompt_s: 4.0,
@@ -214,7 +222,8 @@ impl SeedVcStream<'_> {
         // zeros (a one-off ~35 ms of leading silence at stream start).
         let block22 = self.cfg.block * 441 / 320;
         let xf = self.cfg.crossfade_22k.min(block22);
-        let need = block22 + xf;
+        let search = self.cfg.sola_search_22k;
+        let need = block22 + xf + search;
         let mut out22 = if wave22.len() >= need {
             wave22[wave22.len() - need..].to_vec()
         } else {
@@ -222,16 +231,42 @@ impl SeedVcStream<'_> {
             v.extend_from_slice(&wave22);
             v
         };
+        // SOLA: pick the splice offset whose lead-in best correlates
+        // with the previous tail (normalized cross-correlation over the
+        // crossfade span), then blend there.
+        let k_best = if self.tail.len() == xf && search > 0 {
+            let mut best = (f32::MIN, 0usize);
+            for k in 0..=search {
+                let seg = &out22[k..k + xf];
+                let (mut dot, mut en) = (0f32, 1e-9f32);
+                for (t, s) in self.tail.iter().zip(seg) {
+                    dot += t * s;
+                    en += s * s;
+                }
+                let score = dot / en.sqrt();
+                if score > best.0 {
+                    best = (score, k);
+                }
+            }
+            best.1
+        } else {
+            0
+        };
         if self.tail.len() == xf {
-            for (i, (o, t)) in out22.iter_mut().zip(&self.tail).enumerate() {
+            for i in 0..xf {
                 let w = 0.5 - 0.5 * (std::f64::consts::PI * i as f64 / xf as f64).cos();
-                *o = t * (1.0 - w as f32) + *o * w as f32;
+                out22[k_best + i] =
+                    self.tail[i] * (1.0 - w as f32) + out22[k_best + i] * w as f32;
             }
         }
-        // Hold back the crossfade tail for the next block: the emitted
-        // region is [xf, xf + block22), the lead-in [0, xf) was blended.
-        let emitted: Vec<f32> = out22[..block22].to_vec();
-        self.tail = out22[block22..].to_vec();
+        // Emit one block from the aligned splice point; hold back the
+        // following crossfade span as the next tail.
+        let end = (k_best + block22).min(out22.len());
+        let mut emitted: Vec<f32> = out22[k_best..end].to_vec();
+        emitted.resize(block22, *emitted.last().unwrap_or(&0.0));
+        let t_end = (k_best + block22 + xf).min(out22.len());
+        self.tail = out22[k_best + block22..t_end].to_vec();
+        self.tail.resize(xf, 0.0);
 
         Ok(Some(resample_width(&emitted, 22_050, 48_000, 16)))
     }
