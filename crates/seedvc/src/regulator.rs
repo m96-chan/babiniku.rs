@@ -44,14 +44,17 @@ impl InterpolateRegulator {
         let x = self.proj.forward(content)?; // [1, T, 512]
         let x = x.transpose(1, 2)?.contiguous()?; // [1, 512, T]
         // F.interpolate mode='nearest': src = floor(dst * scale) with
-        // scale computed as a DOUBLE division (aten
-        // nearest_neighbor_compute_source_index) — integer rational
-        // floor differs at exact-boundary indices (every 12th index for
-        // 301 -> 516) and shifts whole frames.
+        // scale computed as a SINGLE-precision division (aten
+        // compute_scales_value<float> feeding
+        // nearest_neighbor_compute_source_index). The f32 scale for
+        // 301 -> 516 is slightly below the exact rational, so
+        // exact-boundary products (e.g. 108 * 301/516 = 63) floor one
+        // frame lower than f64/integer arithmetic would — 7 whole
+        // frames shift for this shape.
         let t = x.dim(2)?;
-        let scale = t as f64 / target_len as f64;
+        let scale = t as f32 / target_len as f32;
         let idx: Vec<u32> = (0..target_len)
-            .map(|i| ((i as f64 * scale).floor() as usize).min(t - 1) as u32)
+            .map(|i| ((i as f32 * scale).floor() as usize).min(t - 1) as u32)
             .collect();
         let idx = Tensor::from_vec(idx, target_len, x.device())?;
         let mut x = x.index_select(&idx, 2)?;
@@ -81,17 +84,18 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device};
 
-    // WIP (#50): max abs diff 6.65e-2 vs the fixture. Verified NOT the
-    // GroupNorm reduction axes nor the nearest-index arithmetic (both
-    // variants bit-identical). Prime suspect: the checkpoint carries a
-    // top-level `net.vq` module (7 tensors, not yet converted by
-    // tools/convert_seedvc.py) and length_regulator.forward applies
-    // `self.vq` when present — the diff would then be the quantization
-    // residual. Next: dump intermediate fixtures (post-proj,
-    // post-interp, per-block) and check whether model.length_regulator
-    // has a vq attribute in the official object.
+    // Tolerance note (#50): the fixture was generated on CUDA with
+    // cuDNN TF32 convolutions (PyTorch default); the official module
+    // itself, re-run in strict fp32 (CPU, or CUDA with TF32 off),
+    // reproduces the fixture only to 1.02e-4 / 1.04e-4 max abs. This
+    // port matches the official fp32 stages to < 2e-5 at every
+    // boundary (post-proj, post-interpolate, per conv block, final),
+    // so the bound below is the fixture's inherent TF32 noise, not a
+    // port residual. (The checkpoint's top-level `net.vq` module is
+    // dead weight: `build_model` never instantiates it and
+    // `vector_quantize: false` means the regulator has no `vq`
+    // attribute, so no quantizer runs at inference.)
     #[test]
-    #[ignore = "WIP #50: 6.65e-2 residual, suspected missing vq stage"]
     fn regulator_matches_official() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ckpt");
         let (w, f) = (
@@ -106,18 +110,20 @@ mod tests {
             unsafe { VarBuilder::from_mmaped_safetensors(&[w], DType::F32, &dev).unwrap() };
         let reg = InterpolateRegulator::load(vb).unwrap();
         let fx = candle_core::safetensors::load(f, &dev).unwrap();
-        let want = &fx["cond"];
-        let target_len = want.dim(1).unwrap();
-        let got = reg.forward(&fx["s_alt"], target_len).unwrap();
-        let d = (got - want)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        println!("regulator max abs diff {d:.2e}");
-        assert!(d < 1e-4, "regulator mismatch: {d}");
+        for (src, dst) in [("s_alt", "cond"), ("s_ori", "prompt_condition")] {
+            let want = &fx[dst];
+            let target_len = want.dim(1).unwrap();
+            let got = reg.forward(&fx[src], target_len).unwrap();
+            let d = (got - want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            println!("regulator {src} -> {dst} max abs diff {d:.2e}");
+            assert!(d < 2e-4, "regulator mismatch ({src}): {d}");
+        }
     }
 }
