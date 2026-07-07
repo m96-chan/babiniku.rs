@@ -22,3 +22,5 @@
 //! like `crates/xvc`).
 
 pub use vc_core::{Error, Result};
+
+pub mod mel;
