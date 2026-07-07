@@ -459,7 +459,6 @@ fn rms(x: &[f32]) -> f32 {
 fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
     let mut r = hound::WavReader::open(path)?;
     let spec = r.spec();
-    anyhow::ensure!(spec.sample_rate == SR as u32, "expected 16 kHz wav: {path}");
     let s: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let sc = (1i64 << (spec.bits_per_sample - 1)) as f32;
@@ -467,7 +466,19 @@ fn read_wav_16k(path: &str) -> anyhow::Result<Vec<f32>> {
         }
         hound::SampleFormat::Float => r.samples::<f32>().map(|v| v.unwrap()).collect(),
     };
-    Ok(s.into_iter().step_by(spec.channels as usize).collect())
+    let mono: Vec<f32> = s.into_iter().step_by(spec.channels as usize).collect();
+    // Any rate is welcome (issue #62 follow-up: a 48 kHz reference is
+    // BETTER — the profile EQ reads it at native rate — so the 16 kHz
+    // engines must not reject it); resample down for the engine.
+    if spec.sample_rate == SR as u32 {
+        Ok(mono)
+    } else {
+        Ok(vc_core::profile::resample_analysis(
+            &mono,
+            spec.sample_rate as usize,
+            SR,
+        ))
+    }
 }
 
 /// Streaming approximation of X-VC's utterance-level percentile volume
