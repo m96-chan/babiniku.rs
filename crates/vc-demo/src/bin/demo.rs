@@ -148,6 +148,9 @@ struct Stats {
     late: u64,
     gated: u64,
     declicks: u64,
+    /// Hard-gate splice fades (sp in the TUI), separate from the guard's
+    /// needle repairs so field reports can attribute a firing layer.
+    splices: u64,
     /// Cross-window replacements (xr in the TUI), separate from
     /// declicks so a per-layer firing rate is visible in the field.
     cross_repairs: u64,
@@ -1035,7 +1038,7 @@ fn run_xvc_conversion(
         // so continuous audio is never touched.
         const SPLICE_FADE: usize = 160; // 10 ms at 16 kHz
         if gated && !prev_gated {
-            stats.lock().unwrap().declicks += 1;
+            stats.lock().unwrap().splices += 1;
             let n = SPLICE_FADE.min(processed.len());
             for i in 0..n {
                 let w = 1.0 - i as f32 / n as f32;
@@ -1600,7 +1603,7 @@ fn main() -> anyhow::Result<()> {
             let st = stats.lock().unwrap();
             let names = engine.stage_names();
             eprint!(
-                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {} dc {} xr {}   ",
+                "\r[{}] chunks {:4}  in {:.3} out {:.3}  RTF {} {:.2} {} {:.2} {} {:.2}  late {} ng {} sp {} xr {}   ",
                 engine.name(),
                 st.chunks,
                 st.in_rms,
@@ -1611,7 +1614,7 @@ fn main() -> anyhow::Result<()> {
                 st.rtf_vc,
                 names[2],
                 st.rtf_voc,
-                st.late, st.declicks, st.cross_repairs
+                st.late, st.declicks, st.splices, st.cross_repairs
             );
             std::io::stderr().flush().ok();
         }
@@ -1681,6 +1684,7 @@ fn run_tui(
                 st.engine_info.clone(),
                 st.declicks,
                 st.cross_repairs,
+                st.splices,
             )
         };
         terminal.draw(|f| {
@@ -1735,7 +1739,7 @@ fn run_tui(
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · dc {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1746,6 +1750,7 @@ fn run_tui(
                     snapshot.6,
                     snapshot.9,
                     snapshot.11,
+                    snapshot.13,
                     snapshot.12,
                     if snapshot.7 { "PASSTHROUGH" } else { "CONVERT" },
                     pitch,

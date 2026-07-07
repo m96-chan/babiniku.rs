@@ -22,11 +22,15 @@
 //! - only contiguous runs up to 2.5 ms are repaired; anything longer is
 //!   real audio by definition and is left alone.
 //!
-//! Repair ATTENUATES the run to the local level with a tapered gain
-//! dip (the eighth field recording pinned audible ticks to the earlier
-//! linear-bridge repair: excising through quiet breathy content leaves
-//! a notch that is itself a tick; a gain dip keeps the waveform
-//! continuous, and a false positive merely softens a transient).
+//! Repair is MATCHED SUBTRACTION: the underlying voice across the run
+//! is estimated with a C1 cubic Hermite spline anchored on the samples
+//! just outside the run (values AND slopes match at both ends), and the
+//! run is replaced by that estimate — equivalently, the needle component
+//! (actual − smooth) is phase-cancelled exactly, per event. Earlier
+//! repairs were audible themselves: a linear bridge notches quiet
+//! content (eighth recording), and even a tapered gain dip dents the
+//! voice's level trajectory enough to read as a soft knock (ninth/tenth
+//! recordings). The spline follows the voice, so nothing is dented.
 //!
 //! The suppressor is streaming: [`NeedleGuard::process`] consumes a
 //! chunk and returns the same number of samples delayed by the context
