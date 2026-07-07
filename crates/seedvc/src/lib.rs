@@ -27,5 +27,6 @@ pub mod bigvgan;
 pub mod campplus;
 pub mod dit;
 pub mod mel;
+pub mod pipeline;
 pub mod regulator;
 pub mod whisper;
