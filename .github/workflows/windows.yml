@@ -1,0 +1,41 @@
+# Windows CI (issue #53): prove the demo crate builds, tests, and boots
+# its audio layer on windows-latest. CI runners have no audio devices, so
+# the audio_probe smoke run is headless (--no-sink --no-capture): it
+# exercises backend init + device enumeration only. Live end-to-end
+# verification (VB-CABLE route, mic capture) stays manual — see
+# docs/windows.md.
+name: windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches the cargo registry + target dir keyed on Cargo.lock.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # vc-demo pulls in the engine crates, so this covers the demo's
+      # whole Windows build surface (cpal/WASAPI backend included).
+      - name: Build vc-demo (release)
+        run: cargo build --release -p vc-demo
+
+      - name: Test vc-demo
+        run: cargo test -p vc-demo
+
+      # Headless smoke: default_backend() on WASAPI + device enumeration,
+      # no checkpoints, no audio hardware needed.
+      - name: Audio probe (headless smoke)
+        run: cargo run --release -p vc-demo --example audio_probe -- --no-sink --no-capture
