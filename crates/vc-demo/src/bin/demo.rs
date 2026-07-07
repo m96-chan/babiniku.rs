@@ -101,6 +101,8 @@ struct Controls {
     pitch_decisemitones: AtomicI32,
     /// RNNoise dry/wet mix in percent (0 = off).
     denoise_mix: AtomicI32,
+    /// Output-side RNNoise wet % (Seed-VC path; < / > keys).
+    out_denoise: AtomicI32,
     /// BWE exciter wet amount in percent (0 = off; issue #42).
     bwe_wet: AtomicI32,
     /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
@@ -182,6 +184,8 @@ struct Args {
     input_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
+    /// Output-side RNNoise wet % (Seed-VC).
+    out_denoise: i32,
     bwe: i32,
     gate_db: i32,
     headless: bool,
@@ -221,6 +225,7 @@ fn parse_args() -> Args {
         input_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
+        out_denoise: 0,
         bwe: 0,
         gate_db: -45,
         headless: false,
@@ -296,6 +301,13 @@ fn parse_args() -> Args {
                     .and_then(|v| v.parse().ok())
                     .expect("--pitch-shift <semitones>")
             }
+            "--out-denoise" => {
+                a.out_denoise = it
+                    .next()
+                    .expect("--out-denoise <0-100>")
+                    .parse()
+                    .expect("--out-denoise takes an integer");
+            }
             "--denoise-mix" => {
                 a.denoise_mix = it
                     .next()
@@ -354,6 +366,54 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
 }
 
 const DENOISED_SRC: &str = "babiniku_denoised";
+
+/// In-process RNNoise at its native 48 kHz, for the OUTPUT side of the
+/// Seed-VC path (field report: a faint noise bed under the converted
+/// voice — diffusion residual — that output NR should scrub). Wet/dry
+/// mix so the air of the voice can be kept.
+#[cfg(feature = "seedvc")]
+struct Rnnoise48k {
+    state: Box<DenoiseState<'static>>,
+    /// Carry so chunks need not align to the 480-sample frames.
+    buf: Vec<f32>,
+    out: Vec<f32>,
+}
+
+#[cfg(feature = "seedvc")]
+impl Rnnoise48k {
+    fn new() -> Self {
+        Self {
+            state: DenoiseState::new(),
+            buf: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Denoises in place with `mix` wet ratio (0 = bypass). Adds up to
+    /// one RNNoise frame (10 ms) of latency via the alignment carry.
+    fn process(&mut self, chunk: &mut [f32], mix: f32) {
+        if mix <= 0.0 {
+            return;
+        }
+        for &s in chunk.iter() {
+            self.buf.push(s * 32768.0);
+        }
+        while self.buf.len() >= DenoiseState::FRAME_SIZE {
+            let frame: Vec<f32> = self.buf.drain(..DenoiseState::FRAME_SIZE).collect();
+            let mut den = vec![0f32; DenoiseState::FRAME_SIZE];
+            self.state.process_frame(&mut den, &frame);
+            for (d, raw) in den.iter().zip(&frame) {
+                self.out
+                    .push((d * mix + raw * (1.0 - mix)) / 32768.0);
+            }
+        }
+        for (i, s) in chunk.iter_mut().enumerate() {
+            *s = if i < self.out.len() { self.out[i] } else { 0.0 };
+        }
+        let n = chunk.len().min(self.out.len());
+        self.out.drain(..n);
+    }
+}
 
 /// In-process RNNoise at 16 kHz: exact x3 up/down resampling around the
 /// 48 kHz, 480-sample RNNoise frames (3200 in -> 20 frames -> 3200 out).
@@ -1425,6 +1485,7 @@ fn main() -> anyhow::Result<()> {
     let controls = Arc::new(Controls {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        out_denoise: AtomicI32::new(args.out_denoise.clamp(0, 100)),
         bwe_wet: AtomicI32::new(args.bwe.clamp(0, 100)),
         gate_db: AtomicI32::new(args.gate_db),
     });
@@ -1556,6 +1617,8 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "seedvc")]
         let mut stretch48 = Stretch::preset_default(1, OUT_SR as u32);
         #[cfg(feature = "seedvc")]
+        let mut rnnoise48 = Rnnoise48k::new();
+        #[cfg(feature = "seedvc")]
         let mut current_semi48 = 0f32;
         // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
         // plus the optional harmonic exciter, after the pitch shifter.
@@ -1602,6 +1665,11 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "seedvc")]
             if let OutMsg::Raw48(c) = &msg {
                 let mut c48 = c.clone();
+                // Output NR before the leveler, so the diffusion noise
+                // bed is scrubbed instead of boosted.
+                let odn =
+                    controls_out.out_denoise.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                rnnoise48.process(&mut c48, odn);
                 // Pitch shift at the output rate (same knob semantics as
                 // the 16 kHz path; bypassed at 0 to avoid its latency).
                 let semi =
@@ -2126,6 +2194,18 @@ fn run_tui(
                         controls
                             .pitch_decisemitones
                             .store((v + 5).min(120), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('<') => {
+                        let v = controls.out_denoise.load(Ordering::Relaxed);
+                        controls
+                            .out_denoise
+                            .store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('>') => {
+                        let v = controls.out_denoise.load(Ordering::Relaxed);
+                        controls
+                            .out_denoise
+                            .store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char(',') => {
                         let v = controls.denoise_mix.load(Ordering::Relaxed);
