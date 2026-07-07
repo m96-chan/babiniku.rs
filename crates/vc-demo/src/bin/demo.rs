@@ -194,6 +194,10 @@ struct Args {
     /// latency is unaffected (only the history part grows). Default:
     /// 2400 (the official GPU preset) on CUDA, 640 on CPU.
     window_ms: Option<usize>,
+    /// Seed-VC CFM steps override (live default 6; more = higher
+    /// quality per hop, fewer = more real-time headroom).
+    #[cfg(feature = "seedvc")]
+    cfm_steps: Option<usize>,
     /// X-VC hop override (ms). Smaller hops shrink both the audible
     /// needle probability (the emitted slice is a smaller fraction of
     /// the window) and the algorithmic latency, at proportionally more
@@ -224,6 +228,8 @@ fn parse_args() -> Args {
         low_latency: false,
         window_ms: None,
         hop_ms: None,
+        #[cfg(feature = "seedvc")]
+        cfm_steps: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -261,6 +267,15 @@ fn parse_args() -> Args {
                         .expect("--window-ms <ms>")
                         .parse()
                         .expect("--window-ms takes an integer"),
+                )
+            }
+            #[cfg(feature = "seedvc")]
+            "--cfm-steps" => {
+                a.cfm_steps = Some(
+                    it.next()
+                        .expect("--cfm-steps <n>")
+                        .parse()
+                        .expect("--cfm-steps takes an integer"),
                 )
             }
             "--hop-ms" => {
@@ -910,6 +925,7 @@ enum Models {
 fn run_seedvc_conversion(
     engine: std::sync::Arc<seedvc::pipeline::SeedVcEngine>,
     ref_22k: Vec<f32>,
+    cfm_steps: Option<usize>,
     mic_input: bool,
     rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
     tx_out: std::sync::mpsc::SyncSender<OutMsg>,
@@ -917,7 +933,10 @@ fn run_seedvc_conversion(
     run: Arc<AtomicBool>,
     controls: Arc<Controls>,
 ) -> anyhow::Result<()> {
-    let cfg = seedvc::stream::StreamConfig::default();
+    let mut cfg = seedvc::stream::StreamConfig::default();
+    if let Some(steps) = cfm_steps {
+        cfg.steps = steps;
+    }
     let hop_s = cfg.block as f32 / SR as f32;
     stats.lock().unwrap().engine_info = format!(
         "block {} ms · ctx {:.1} s · cfm {} steps",
@@ -935,6 +954,7 @@ fn run_seedvc_conversion(
     let deep_chunks: u32 = (960 / (cfg.block * 1000 / SR).max(1)) as u32;
     let mut open_for = 0u32;
     let mut deep_for = 0u32;
+    let mut hops = 0u64;
     let mut was_passthrough = false;
 
     while run.load(Ordering::Relaxed) {
@@ -1009,10 +1029,13 @@ fn run_seedvc_conversion(
                 break;
             };
             let dt = t0.elapsed().as_secs_f32();
+            hops += 1;
             {
                 let mut st = stats.lock().unwrap();
                 st.rtf_vc = dt / hop_s;
-                if dt > hop_s {
+                // Warm-up grace like the X-VC drain: the first hops
+                // absorb one-off CUDA kernel/allocator costs.
+                if dt > hop_s && hops > 4 {
                     st.late += 1;
                 }
             }
@@ -1528,6 +1551,11 @@ fn main() -> anyhow::Result<()> {
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
+        // Second shifter for the 48 kHz direct path (Seed-VC).
+        #[cfg(feature = "seedvc")]
+        let mut stretch48 = Stretch::preset_default(1, OUT_SR as u32);
+        #[cfg(feature = "seedvc")]
+        let mut current_semi48 = 0f32;
         // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
         // plus the optional harmonic exciter, after the pitch shifter.
         let mut upsampler = Upsampler3x::new();
@@ -1573,6 +1601,20 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "seedvc")]
             if let OutMsg::Raw48(c) = &msg {
                 let mut c48 = c.clone();
+                // Pitch shift at the output rate (same knob semantics as
+                // the 16 kHz path; bypassed at 0 to avoid its latency).
+                let semi =
+                    controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
+                if semi.abs() > 0.05 {
+                    if (semi - current_semi48).abs() > 0.01 {
+                        stretch48
+                            .set_transpose_factor_semitones(semi, Some(8_000.0 / OUT_SR as f32));
+                        current_semi48 = semi;
+                    }
+                    let mut shifted = vec![0f32; c48.len()];
+                    stretch48.process(&c48, &mut shifted);
+                    c48 = shifted;
+                }
                 leveler.process(&mut c48);
                 let wet =
                     controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
@@ -1681,6 +1723,8 @@ fn main() -> anyhow::Result<()> {
     let run_vc = run.clone();
     let controls_vc = controls.clone();
     let xvc_cross_check = !args.low_latency;
+    #[cfg(feature = "seedvc")]
+    let seedvc_cfm_steps = args.cfm_steps;
     // Window default per device (issue #42 knee search): CUDA absorbs
     // the official 2400 ms window (~4x fewer decoder needles, worst hop
     // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
@@ -1699,6 +1743,7 @@ fn main() -> anyhow::Result<()> {
                 return run_seedvc_conversion(
                     engine,
                     ref_22k,
+                    seedvc_cfm_steps,
                     mic_input,
                     rx_in,
                     tx_out,

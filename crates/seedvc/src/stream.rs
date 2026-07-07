@@ -30,8 +30,9 @@ pub struct StreamConfig {
     pub dit_context: usize,
     /// Crossfade at block joins, in 22 050 Hz samples (~40 ms).
     pub crossfade_22k: usize,
-    /// CFM steps / cfg rate. 8 steps (offline default 10) keeps the
-    /// step time ~25 % under the block budget on CUDA.
+    /// CFM steps / cfg rate. 6 steps live (offline default 10): 8 left
+    /// only ~22 % headroom on CUDA and desktop GPU contention pushed
+    /// hops over the block budget; 6 gives ~40 %.
     pub steps: usize,
     pub cfg_rate: f64,
     /// Reference prompt cap in seconds: the prompt occupies the DiT
@@ -47,7 +48,7 @@ impl Default for StreamConfig {
             context: 40_000,
             dit_context: 8_000,
             crossfade_22k: 882,
-            steps: 8,
+            steps: 6,
             cfg_rate: 0.7,
             max_prompt_s: 4.0,
         }
