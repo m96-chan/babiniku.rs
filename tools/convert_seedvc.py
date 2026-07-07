@@ -81,10 +81,11 @@ def main():
         fp32(ck["length_regulator"]),
         os.path.join(args.out, "seedvc_regulator.safetensors"),
     )
-    save_file(
-        fp32(ck["style_encoder"]),
-        os.path.join(args.out, "seedvc_campplus.safetensors"),
-    )
+    # NOTE: ck["style_encoder"] is a MelStyleEncoder that the inference
+    # path never uses — the actual speaker encoder is the standalone
+    # funasr CAM++ checkpoint (campplus_cn_common.bin).
+    camp = torch.load(find("campplus_cn_common.bin"), map_location="cpu", weights_only=False)
+    save_file(fp32(camp), os.path.join(args.out, "seedvc_campplus.safetensors"))
     print("dit / regulator / campplus written")
 
     # --- BigVGAN (weight norm folded) ------------------------------------

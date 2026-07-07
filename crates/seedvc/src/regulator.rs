@@ -2,7 +2,7 @@
 //! `content_in_proj` (768 → 512) → nearest interpolation to the target
 //! mel length → 4 × [Conv1d k3 p1 → GroupNorm(1) → Mish] → Conv1d k1.
 
-use candle_core::{IndexOp, Module, Tensor};
+use candle_core::{Module, Tensor};
 use candle_nn::{conv1d, linear, Conv1d, Conv1dConfig, Linear, VarBuilder};
 
 use crate::Result;
