@@ -58,7 +58,7 @@ The engine core is pure Rust and portable; the platform surface — capture/play
 | Platform | Capture / playback | Virtual mic | Status |
 |---|---|---|---|
 | Linux | PulseAudio/PipeWire | ✅ null sink + remap (`babiniku_mic`) | ✅ working |
-| Windows | WASAPI (`cpal`) | routed to VB-CABLE / VoiceMeeter (auto-detected or `--output-device`) | 🔬 build- & unit-verified, live verification in [#53](https://github.com/m96-chan/babiniku.rs/issues/53) |
+| [Windows](docs/windows.md) | WASAPI (`cpal`) | routed to VB-CABLE / VoiceMeeter (auto-detected or `--output-device`) | ⏳ implemented — verify on a real Windows machine ([#53](https://github.com/m96-chan/babiniku.rs/issues/53), PR pending) |
 | macOS | CoreAudio (`cpal`) | routed to BlackHole (auto-detected or `--output-device`) | 🔬 build- & unit-verified, live verification in [#54](https://github.com/m96-chan/babiniku.rs/issues/54) |
 | Android / iOS | AAudio / AVAudioEngine | in-app routing (library-first) | 📋 planned ([#56](https://github.com/m96-chan/babiniku.rs/issues/56) / [#57](https://github.com/m96-chan/babiniku.rs/issues/57)) |
 
