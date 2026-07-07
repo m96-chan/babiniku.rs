@@ -79,6 +79,10 @@ const CHUNK_SAMPLES: usize = 3_200; // 200 ms = one CARD chunk (20 mel frames)
 /// X-VC hop: 240 ms of new audio per re-encoded 640 ms window (the CPU
 /// streaming preset 640/240/100/20 from issue #30).
 const XVC_CHUNK_SAMPLES: usize = 3_840;
+/// Seed-VC live block (320 ms at 16 kHz — the official real-time GUI
+/// range is 250–300 ms; 320 keeps whole 20 ms frames).
+#[cfg(feature = "seedvc")]
+const SEEDVC_CHUNK_SAMPLES: usize = 5_120;
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
@@ -97,6 +101,8 @@ struct Controls {
     pitch_decisemitones: AtomicI32,
     /// RNNoise dry/wet mix in percent (0 = off).
     denoise_mix: AtomicI32,
+    /// Output-side RNNoise wet % (Seed-VC path; < / > keys).
+    out_denoise: AtomicI32,
     /// BWE exciter wet amount in percent (0 = off; issue #42).
     bwe_wet: AtomicI32,
     /// Input gate threshold in dBFS (chunk RMS); the model hallucinates
@@ -110,6 +116,8 @@ struct Controls {
 enum EngineKind {
     MeanVc,
     Xvc,
+    #[cfg(feature = "seedvc")]
+    SeedVc,
 }
 
 impl EngineKind {
@@ -117,6 +125,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => "meanvc",
             EngineKind::Xvc => "xvc",
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => "seedvc",
         }
     }
 
@@ -125,6 +135,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => CHUNK_SAMPLES,
             EngineKind::Xvc => XVC_CHUNK_SAMPLES,
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => SEEDVC_CHUNK_SAMPLES,
         }
     }
 
@@ -133,6 +145,8 @@ impl EngineKind {
         match self {
             EngineKind::MeanVc => ["asr", "vc", "vocoder"],
             EngineKind::Xvc => ["semantic", "convert", "decode"],
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => ["content", "cfm", "vocoder"],
         }
     }
 }
@@ -170,6 +184,8 @@ struct Args {
     input_device: Option<String>,
     pitch_shift: f32,
     denoise_mix: i32,
+    /// Output-side RNNoise wet % (Seed-VC).
+    out_denoise: i32,
     bwe: i32,
     gate_db: i32,
     headless: bool,
@@ -182,6 +198,10 @@ struct Args {
     /// latency is unaffected (only the history part grows). Default:
     /// 2400 (the official GPU preset) on CUDA, 640 on CPU.
     window_ms: Option<usize>,
+    /// Seed-VC CFM steps override (live default 6; more = higher
+    /// quality per hop, fewer = more real-time headroom).
+    #[cfg(feature = "seedvc")]
+    cfm_steps: Option<usize>,
     /// X-VC hop override (ms). Smaller hops shrink both the audible
     /// needle probability (the emitted slice is a smaller fraction of
     /// the window) and the algorithmic latency, at proportionally more
@@ -205,6 +225,7 @@ fn parse_args() -> Args {
         input_device: None,
         pitch_shift: 0.0,
         denoise_mix: 0,
+        out_denoise: 0,
         bwe: 0,
         gate_db: -45,
         headless: false,
@@ -212,6 +233,8 @@ fn parse_args() -> Args {
         low_latency: false,
         window_ms: None,
         hop_ms: None,
+        #[cfg(feature = "seedvc")]
+        cfm_steps: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -224,8 +247,13 @@ fn parse_args() -> Args {
                 a.engine = match it.next().as_deref() {
                     Some("meanvc") => EngineKind::MeanVc,
                     Some("xvc") => EngineKind::Xvc,
+                    #[cfg(feature = "seedvc")]
+                    Some("seedvc") => EngineKind::SeedVc,
                     other => {
-                        eprintln!("--engine must be meanvc or xvc (got {other:?})");
+                        eprintln!(
+                            "--engine must be meanvc or xvc{} (got {other:?})",
+                            if cfg!(feature = "seedvc") { " or seedvc" } else { "" }
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -246,6 +274,15 @@ fn parse_args() -> Args {
                         .expect("--window-ms takes an integer"),
                 )
             }
+            #[cfg(feature = "seedvc")]
+            "--cfm-steps" => {
+                a.cfm_steps = Some(
+                    it.next()
+                        .expect("--cfm-steps <n>")
+                        .parse()
+                        .expect("--cfm-steps takes an integer"),
+                )
+            }
             "--hop-ms" => {
                 a.hop_ms = Some(
                     it.next()
@@ -263,6 +300,13 @@ fn parse_args() -> Args {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .expect("--pitch-shift <semitones>")
+            }
+            "--out-denoise" => {
+                a.out_denoise = it
+                    .next()
+                    .expect("--out-denoise <0-100>")
+                    .parse()
+                    .expect("--out-denoise takes an integer");
             }
             "--denoise-mix" => {
                 a.denoise_mix = it
@@ -322,6 +366,54 @@ fn create_virtual_device() -> anyhow::Result<Vec<String>> {
 }
 
 const DENOISED_SRC: &str = "babiniku_denoised";
+
+/// In-process RNNoise at its native 48 kHz, for the OUTPUT side of the
+/// Seed-VC path (field report: a faint noise bed under the converted
+/// voice — diffusion residual — that output NR should scrub). Wet/dry
+/// mix so the air of the voice can be kept.
+#[cfg(feature = "seedvc")]
+struct Rnnoise48k {
+    state: Box<DenoiseState<'static>>,
+    /// Carry so chunks need not align to the 480-sample frames.
+    buf: Vec<f32>,
+    out: Vec<f32>,
+}
+
+#[cfg(feature = "seedvc")]
+impl Rnnoise48k {
+    fn new() -> Self {
+        Self {
+            state: DenoiseState::new(),
+            buf: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Denoises in place with `mix` wet ratio (0 = bypass). Adds up to
+    /// one RNNoise frame (10 ms) of latency via the alignment carry.
+    fn process(&mut self, chunk: &mut [f32], mix: f32) {
+        if mix <= 0.0 {
+            return;
+        }
+        for &s in chunk.iter() {
+            self.buf.push(s * 32768.0);
+        }
+        while self.buf.len() >= DenoiseState::FRAME_SIZE {
+            let frame: Vec<f32> = self.buf.drain(..DenoiseState::FRAME_SIZE).collect();
+            let mut den = vec![0f32; DenoiseState::FRAME_SIZE];
+            self.state.process_frame(&mut den, &frame);
+            for (d, raw) in den.iter().zip(&frame) {
+                self.out
+                    .push((d * mix + raw * (1.0 - mix)) / 32768.0);
+            }
+        }
+        for (i, s) in chunk.iter_mut().enumerate() {
+            *s = if i < self.out.len() { self.out[i] } else { 0.0 };
+        }
+        let n = chunk.len().min(self.out.len());
+        self.out.drain(..n);
+    }
+}
 
 /// In-process RNNoise at 16 kHz: exact x3 up/down resampling around the
 /// 48 kHz, 480-sample RNNoise frames (3200 in -> 20 frames -> 3200 out).
@@ -786,10 +878,11 @@ fn load_voice_print(
     )
 }
 
-/// Device for the X-VC engine: CPU is the project baseline (never
-/// requires a GPU); a build with `--features cuda` places the whole
-/// engine on `cuda:0` when one is present (`--cpu` opts out). The
-/// meanvc engine stays on CPU — it is already real time there.
+/// Accelerator selection for the X-VC and Seed-VC engines: CPU is the
+/// project baseline (never requires a GPU); a build with
+/// `--features cuda` places the whole engine on `cuda:0` when one is
+/// present (`--cpu` opts out). The meanvc engine stays on CPU — it is
+/// already real time there.
 #[cfg(feature = "cuda")]
 fn xvc_device(force_cpu: bool) -> Device {
     if force_cpu {
@@ -797,7 +890,7 @@ fn xvc_device(force_cpu: bool) -> Device {
     }
     match Device::new_cuda(0) {
         Ok(d) => {
-            eprintln!("xvc engine on cuda:0");
+            eprintln!("accelerator: cuda:0");
             d
         }
         Err(e) => {
@@ -837,6 +930,11 @@ fn pulse_spec_out() -> Spec {
 enum OutMsg {
     Mel(Tensor),
     Raw(Vec<f32>),
+    /// Already at the 48 kHz output rate (Seed-VC path: BigVGAN gives
+    /// real bandwidth up to 11 kHz, so the 16→48 upsampler and pitch
+    /// stage are bypassed; exciter/leveler/limiter still apply).
+    #[cfg(feature = "seedvc")]
+    Raw48(Vec<f32>),
 }
 
 /// Per-engine model state, moved into the conversion thread.
@@ -852,6 +950,13 @@ enum Models {
         /// ([`xvc::XvcPipelinedStream`]).
         engine: std::sync::Arc<xvc::XvcEngine>,
         reference: xvc::Reference,
+    },
+    #[cfg(feature = "seedvc")]
+    SeedVc {
+        engine: std::sync::Arc<seedvc::pipeline::SeedVcEngine>,
+        /// Reference audio at 22 050 Hz (conditions are precomputed by
+        /// the stream itself).
+        ref_22k: Vec<f32>,
     },
 }
 
@@ -869,6 +974,138 @@ enum Models {
 /// of permanently flagging every later hop (steady-state pipeline latency
 /// sits ~100 ms above the first, contention-free hop; unbounded drift,
 /// not a constant offset, is what breaks live playback).
+/// Seed-VC live conversion (issue #50): sliding-context re-conversion
+/// per 320 ms block (`seedvc::stream::SeedVcStream`), soft-gate
+/// expander in front like the X-VC path, deep silence hard-skipped
+/// (whisper/CFM on pure silence both hallucinate and burn compute).
+/// Emits 48 kHz blocks (`OutMsg::Raw48`); there is no needle guard or
+/// cross-check — the BigVGAN decoder line has no needle pathology
+/// (issue #49), which is the reason this engine exists.
+#[cfg(feature = "seedvc")]
+#[allow(clippy::too_many_arguments)]
+fn run_seedvc_conversion(
+    engine: std::sync::Arc<seedvc::pipeline::SeedVcEngine>,
+    ref_22k: Vec<f32>,
+    cfm_steps: Option<usize>,
+    mic_input: bool,
+    rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
+    tx_out: std::sync::mpsc::SyncSender<OutMsg>,
+    stats: Arc<Mutex<Stats>>,
+    run: Arc<AtomicBool>,
+    controls: Arc<Controls>,
+) -> anyhow::Result<()> {
+    let mut cfg = seedvc::stream::StreamConfig::default();
+    if let Some(steps) = cfm_steps {
+        cfg.steps = steps;
+    }
+    let hop_s = cfg.block as f32 / SR as f32;
+    stats.lock().unwrap().engine_info = format!(
+        "block {} ms · ctx {:.1} s · cfm {} steps",
+        cfg.block * 1000 / SR,
+        cfg.context as f32 / SR as f32,
+        cfg.steps,
+    );
+    let mut stream = engine
+        .stream(&ref_22k, cfg)
+        .map_err(|e| anyhow::anyhow!("seedvc reference prep: {e}"))?;
+    let mut norm = MicVolumeNormalizer::new();
+    let mut hp = HighpassBiquad::new(SR as f64, 40.0);
+    let mut expander = SoftExpander::new(SR as f32);
+    let hangover: u32 = (480 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let deep_chunks: u32 = (960 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let mut open_for = 0u32;
+    let mut deep_for = 0u32;
+    let mut hops = 0u64;
+    let mut was_passthrough = false;
+
+    while run.load(Ordering::Relaxed) {
+        let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(_) => continue,
+        };
+        let passthrough = stats.lock().unwrap().passthrough;
+        let in_level = rms(&chunk);
+        if passthrough {
+            was_passthrough = true;
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.out_rms = in_level;
+            st.chunks += 1;
+            drop(st);
+            let _ = tx_out.send(OutMsg::Raw(chunk));
+            continue;
+        }
+        if was_passthrough {
+            stream = engine
+                .stream(&ref_22k, cfg)
+                .map_err(|e| anyhow::anyhow!("seedvc stream restart: {e}"))?;
+            hp = HighpassBiquad::new(SR as f64, 40.0);
+            expander = SoftExpander::new(SR as f32);
+            was_passthrough = false;
+        }
+
+        let gate = controls.gate_db.load(Ordering::Relaxed);
+        let db = 20.0 * in_level.max(1e-9).log10();
+        if db >= gate as f32 {
+            open_for = hangover + 1;
+        }
+        open_for = open_for.saturating_sub(1);
+        if db < gate as f32 - 18.0 {
+            deep_for += 1;
+        } else {
+            deep_for = 0;
+        }
+        let gated = deep_for >= deep_chunks;
+
+        let mut prepared: Vec<f32> = if mic_input {
+            let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
+            norm.process(&mut c64);
+            hp.process(&mut c64);
+            c64.iter().map(|&s| s as f32).collect()
+        } else {
+            chunk.clone()
+        };
+        expander.process(&mut prepared, open_for > 0);
+
+        {
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.chunks += 1;
+            if gated {
+                st.gated += 1;
+            }
+        }
+        if gated {
+            // Deep silence: skip the model entirely, emit 48 kHz zeros.
+            let _ = tx_out.send(OutMsg::Raw48(vec![0.0; prepared.len() * 3]));
+            continue;
+        }
+        stream.push(&prepared);
+        while stream.ready() {
+            let t0 = Instant::now();
+            let Some(out48) = stream
+                .step()
+                .map_err(|e| anyhow::anyhow!("seedvc step: {e}"))?
+            else {
+                break;
+            };
+            let dt = t0.elapsed().as_secs_f32();
+            hops += 1;
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_vc = dt / hop_s;
+                // Warm-up grace like the X-VC drain: the first hops
+                // absorb one-off CUDA kernel/allocator costs.
+                if dt > hop_s && hops > 4 {
+                    st.late += 1;
+                }
+            }
+            let _ = tx_out.send(OutMsg::Raw48(out48));
+        }
+    }
+    Ok(())
+}
+
 /// Microphone input is preprocessed incrementally (sliding-percentile
 /// volume normalization + streaming 40 Hz high-pass); wav input arrives
 /// already preprocessed offline.
@@ -1170,6 +1407,40 @@ fn main() -> anyhow::Result<()> {
                 None,
             )
         }
+        #[cfg(feature = "seedvc")]
+        EngineKind::SeedVc => {
+            let sdev = xvc_device(args.cpu);
+            let seng = seedvc::pipeline::SeedVcEngine::load("ckpt", &sdev)
+                .map_err(|e| anyhow::anyhow!("cannot load the Seed-VC engine: {e}"))?;
+            // The engine world is 22 050 Hz; accept any wav rate.
+            let mut r = hound::WavReader::open(&args.reference)?;
+            let spec = r.spec();
+            let raw: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Int => {
+                    let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                    r.samples::<i32>()
+                        .step_by(spec.channels as usize)
+                        .map(|v| v.map(|x| x as f32 / scale))
+                        .collect::<Result<_, _>>()?
+                }
+                hound::SampleFormat::Float => r
+                    .samples::<f32>()
+                    .step_by(spec.channels as usize)
+                    .collect::<Result<_, _>>()?,
+            };
+            let ref_22k = if spec.sample_rate == 22_050 {
+                raw
+            } else {
+                seedvc::pipeline::resample(&raw, spec.sample_rate as usize, 22_050)
+            };
+            (
+                Models::SeedVc {
+                    engine: std::sync::Arc::new(seng),
+                    ref_22k,
+                },
+                None,
+            )
+        }
     };
 
     // Ctrl-C / SIGTERM funnels into the same shutdown path as `q`, so the
@@ -1214,6 +1485,7 @@ fn main() -> anyhow::Result<()> {
     let controls = Arc::new(Controls {
         pitch_decisemitones: AtomicI32::new((args.pitch_shift * 10.0).round() as i32),
         denoise_mix: AtomicI32::new(args.denoise_mix.clamp(0, 100)),
+        out_denoise: AtomicI32::new(args.out_denoise.clamp(0, 100)),
         bwe_wet: AtomicI32::new(args.bwe.clamp(0, 100)),
         gate_db: AtomicI32::new(args.gate_db),
     });
@@ -1240,6 +1512,10 @@ fn main() -> anyhow::Result<()> {
                 let raw: Vec<f64> = read_wav_16k(path)?.iter().map(|&s| s as f64).collect();
                 xvc::preprocess::preprocess(&raw, &Default::default())
             }
+            // Seed-VC file input needs no offline preprocessing: the
+            // stream handles rates internally from 16 kHz chunks.
+            #[cfg(feature = "seedvc")]
+            EngineKind::SeedVc => read_wav_16k(path)?,
         }),
     };
     let mic_input = wav_samples.is_none();
@@ -1337,6 +1613,13 @@ fn main() -> anyhow::Result<()> {
     let output = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
+        // Second shifter for the 48 kHz direct path (Seed-VC).
+        #[cfg(feature = "seedvc")]
+        let mut stretch48 = Stretch::preset_default(1, OUT_SR as u32);
+        #[cfg(feature = "seedvc")]
+        let mut rnnoise48 = Rnnoise48k::new();
+        #[cfg(feature = "seedvc")]
+        let mut current_semi48 = 0f32;
         // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
         // plus the optional harmonic exciter, after the pitch shifter.
         let mut upsampler = Upsampler3x::new();
@@ -1379,8 +1662,52 @@ fn main() -> anyhow::Result<()> {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
             };
+            #[cfg(feature = "seedvc")]
+            if let OutMsg::Raw48(c) = &msg {
+                let mut c48 = c.clone();
+                // Output NR before the leveler, so the diffusion noise
+                // bed is scrubbed instead of boosted.
+                let odn =
+                    controls_out.out_denoise.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                rnnoise48.process(&mut c48, odn);
+                // Pitch shift at the output rate (same knob semantics as
+                // the 16 kHz path; bypassed at 0 to avoid its latency).
+                let semi =
+                    controls_out.pitch_decisemitones.load(Ordering::Relaxed) as f32 / 10.0;
+                if semi.abs() > 0.05 {
+                    if (semi - current_semi48).abs() > 0.01 {
+                        stretch48
+                            .set_transpose_factor_semitones(semi, Some(8_000.0 / OUT_SR as f32));
+                        current_semi48 = semi;
+                    }
+                    let mut shifted = vec![0f32; c48.len()];
+                    stretch48.process(&c48, &mut shifted);
+                    c48 = shifted;
+                }
+                leveler.process(&mut c48);
+                let wet =
+                    controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                exciter.process(&mut c48, wet);
+                limiter.process(&mut c48);
+                {
+                    let mut st = stats_out.lock().unwrap();
+                    st.out_rms = rms(&c48);
+                }
+                if let Some(p) = &play {
+                    let bytes: Vec<u8> = c48.iter().flat_map(|s| s.to_ne_bytes()).collect();
+                    p.write(&bytes).map_err(|e| anyhow::anyhow!("write: {e}"))?;
+                }
+                if let Some(w) = writer.as_mut() {
+                    for s in &c48 {
+                        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
+                    }
+                }
+                continue;
+            }
             let chunk: Vec<f32> = match msg {
                 OutMsg::Raw(c) => c,
+                #[cfg(feature = "seedvc")]
+                OutMsg::Raw48(_) => unreachable!("handled above"),
                 OutMsg::Mel(mel) => {
                     // Vocoding with a mel tail as left context (MeanVC
                     // only; the X-VC engine decodes to waveform itself).
@@ -1465,6 +1792,8 @@ fn main() -> anyhow::Result<()> {
     let run_vc = run.clone();
     let controls_vc = controls.clone();
     let xvc_cross_check = !args.low_latency;
+    #[cfg(feature = "seedvc")]
+    let seedvc_cfm_steps = args.cfm_steps;
     // Window default per device (issue #42 knee search): CUDA absorbs
     // the official 2400 ms window (~4x fewer decoder needles, worst hop
     // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
@@ -1478,6 +1807,20 @@ fn main() -> anyhow::Result<()> {
 
     let vc = std::thread::spawn(move || -> anyhow::Result<()> {
         let (model, asr, prompt_mel, spks) = match models {
+            #[cfg(feature = "seedvc")]
+            Models::SeedVc { engine, ref_22k } => {
+                return run_seedvc_conversion(
+                    engine,
+                    ref_22k,
+                    seedvc_cfm_steps,
+                    mic_input,
+                    rx_in,
+                    tx_out,
+                    stats_vc,
+                    run_vc,
+                    controls_vc,
+                );
+            }
             Models::Xvc {
                 engine: xeng,
                 reference,
@@ -1776,10 +2119,11 @@ fn run_tui(
             let mix = controls.denoise_mix.load(Ordering::Relaxed);
             let bwe = controls.bwe_wet.load(Ordering::Relaxed);
             let gate = controls.gate_db.load(Ordering::Relaxed);
+            let out_nr = controls.out_denoise.load(Ordering::Relaxed);
             let names = engine.stage_names();
             f.render_widget(
                 Paragraph::new(format!(
-                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  output 48 kHz  ·  {}",
+                    "RTF  {} {:.2} · {} {:.2} · {} {:.2}\nchunks {} · late {} · gated {} · ng {} · sp {} · xr {} · mode {}\npitch {:+.1} st ([ / ])  ·  denoise mix {}% (, / .)  ·  gate {} dB (- / =)\nbwe exciter {}% (; / ')  ·  out-nr {}% (< / >)  ·  output 48 kHz  ·  {}",
                     names[0],
                     snapshot.2,
                     names[1],
@@ -1797,6 +2141,7 @@ fn run_tui(
                     mix,
                     gate,
                     bwe,
+                    out_nr,
                     if snapshot.10.is_empty() {
                         "engine defaults"
                     } else {
@@ -1851,6 +2196,18 @@ fn run_tui(
                         controls
                             .pitch_decisemitones
                             .store((v + 5).min(120), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('<') => {
+                        let v = controls.out_denoise.load(Ordering::Relaxed);
+                        controls
+                            .out_denoise
+                            .store((v - 10).max(0), Ordering::Relaxed);
+                    }
+                    KeyCode::Char('>') => {
+                        let v = controls.out_denoise.load(Ordering::Relaxed);
+                        controls
+                            .out_denoise
+                            .store((v + 10).min(100), Ordering::Relaxed);
                     }
                     KeyCode::Char(',') => {
                         let v = controls.denoise_mix.load(Ordering::Relaxed);
