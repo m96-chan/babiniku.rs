@@ -23,5 +23,8 @@
 
 pub use vc_core::{Error, Result};
 
+pub mod bigvgan;
+pub mod campplus;
+pub mod dit;
 pub mod mel;
 pub mod regulator;
