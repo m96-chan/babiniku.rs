@@ -34,6 +34,13 @@
 //! ([`vc_core::bwe::Exciter`], off by default) synthesizes the missing
 //! 8–16 kHz band; `--bwe <0-100>` sets the wet amount.
 //!
+//! Checkpoints (issue #69): `--ckpt-dir <dir>` points at the model
+//! checkpoint directory; without it the binary honors
+//! `BABINIKU_CKPT_DIR`, then `./ckpt` (repo checkout), then the
+//! platform data dir (`~/.local/share/babiniku/ckpt` and friends — see
+//! [`babiniku::ckpt`]), so installed binaries work outside a checkout.
+//! `--version` prints the version and the compiled feature set.
+//!
 //! Options: `--pitch-shift <semitones>` / `--denoise-mix <0-100>` /
 //! `--bwe <0-100>` set the initial knob values, `--denoise` inserts
 //! PipeWire's WebRTC noise suppression in
@@ -179,7 +186,12 @@ struct Stats {
 
 struct Args {
     engine: EngineKind,
-    reference: String,
+    /// Checkpoint directory override (`--ckpt-dir`); `None` resolves via
+    /// [`babiniku::ckpt::resolve`] (env var → ./ckpt → platform default).
+    ckpt_dir: Option<String>,
+    /// Reference wav (`--reference`); `None` falls back to `test.wav`
+    /// inside the resolved checkpoint directory.
+    reference: Option<String>,
     voice_print: Option<String>,
     wav: Option<String>,
     out: Option<String>,
@@ -232,7 +244,8 @@ fn die(msg: &str) -> ! {
 fn parse_args() -> Args {
     let mut a = Args {
         engine: EngineKind::MeanVc,
-        reference: "ckpt/test.wav".into(),
+        ckpt_dir: None,
+        reference: None,
         voice_print: None,
         wav: None,
         out: None,
@@ -259,6 +272,16 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
         match f.as_str() {
+            "--version" | "-V" => {
+                println!("{}", babiniku::buildinfo::version_line());
+                if let Some(notice) = babiniku::buildinfo::gpl_notice() {
+                    println!("{notice}");
+                }
+                std::process::exit(0);
+            }
+            "--ckpt-dir" => {
+                a.ckpt_dir = Some(it.next().unwrap_or_else(|| die("--ckpt-dir <dir>")))
+            }
             "--engine" => {
                 a.engine = match it.next().as_deref() {
                     Some("meanvc") => EngineKind::MeanVc,
@@ -278,7 +301,9 @@ fn parse_args() -> Args {
                     }
                 }
             }
-            "--reference" => a.reference = it.next().unwrap_or_else(|| die("--reference <wav>")),
+            "--reference" => {
+                a.reference = Some(it.next().unwrap_or_else(|| die("--reference <wav>")))
+            }
             "--voice-print" => {
                 a.voice_print = Some(it.next().unwrap_or_else(|| die("--voice-print <safetensors>")))
             }
@@ -623,11 +648,12 @@ impl MicVolumeNormalizer {
 
 /// Voice print: an explicitly passed safetensors file, otherwise (feature
 /// "wavlm") computed natively FROM THE REFERENCE AUDIO via the ONNX
-/// WavLM-Large SV model at ckpt/wavlm_sv.onnx. There is deliberately no
-/// file fallback: a stale precomputed voice print of a different speaker
-/// silently overrides the reference timbre.
+/// WavLM-Large SV model at `<ckpt>/wavlm_sv.onnx`. There is deliberately
+/// no file fallback: a stale precomputed voice print of a different
+/// speaker silently overrides the reference timbre.
 fn load_voice_print(
     args: &Args,
+    #[cfg_attr(not(feature = "wavlm"), allow(unused_variables))] ckpt: &std::path::Path,
     #[cfg_attr(not(feature = "wavlm"), allow(unused_variables))] reference: &[f32],
     device: &Device,
 ) -> anyhow::Result<Tensor> {
@@ -642,8 +668,12 @@ fn load_voice_print(
     #[cfg(feature = "wavlm")]
     {
         use meanvc2::encoders::SpeakerEncoder;
-        eprintln!("computing voice print from the reference audio (WavLM, ckpt/wavlm_sv.onnx)…");
-        let sv = meanvc2::backends::WavLmSv::load("ckpt/wavlm_sv.onnx")?;
+        let onnx = ckpt.join("wavlm_sv.onnx");
+        eprintln!(
+            "computing voice print from the reference audio (WavLM, {})…",
+            onnx.display()
+        );
+        let sv = meanvc2::backends::WavLmSv::load(&onnx)?;
         Ok(sv.embed(reference, SR)?)
     }
     #[cfg(not(feature = "wavlm"))]
@@ -1093,6 +1123,26 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("RAYON_NUM_THREADS", num_cpus::get_physical().to_string());
     }
     let args = parse_args();
+    // Checkpoint directory (issue #69): flag → BABINIKU_CKPT_DIR →
+    // ./ckpt → platform data dir, so installed binaries work outside a
+    // repo checkout. Fail early with the resolved path and the knobs —
+    // the per-file errors inside the engines are much less actionable.
+    let ckpt = babiniku::ckpt::resolve(args.ckpt_dir.as_deref().map(std::path::Path::new));
+    if !ckpt.is_dir() {
+        eprintln!(
+            "checkpoint directory not found: {}\n\
+             put the converted checkpoints there, or point at them with\n\
+             --ckpt-dir <dir> (or the BABINIKU_CKPT_DIR environment variable).\n\
+             checkpoint setup: docs/meanvc.md · docs/xvc.md · docs/seedvc.md\n\
+             (https://github.com/m96-chan/babiniku.rs)",
+            ckpt.display()
+        );
+        std::process::exit(2);
+    }
+    let reference: String = args
+        .reference
+        .clone()
+        .unwrap_or_else(|| ckpt.join("test.wav").to_string_lossy().into_owned());
     let device = Device::Cpu;
     let engine = args.engine;
     // Hop default per device: 120 ms on CUDA (the official GPU preset).
@@ -1118,22 +1168,22 @@ fn main() -> anyhow::Result<()> {
         EngineKind::MeanVc => {
             let model = MeanVc1::load(
                 MeanVc1Config::default(),
-                "ckpt/model_200ms.safetensors",
+                ckpt.join("model_200ms.safetensors"),
                 &device,
             )?;
             let asr = FastU2pp::load(
                 FastU2ppConfig::official_meanvc1(),
-                "ckpt/fastu2pp.safetensors",
+                ckpt.join("fastu2pp.safetensors"),
                 &device,
             )?;
             let vocos = Vocos::load(
                 VocosConfig::official_meanvc1(),
-                "ckpt/vocos.safetensors",
+                ckpt.join("vocos.safetensors"),
                 &device,
             )?;
-            let reference = read_wav_16k(&args.reference)?;
-            let prompt_mel = MelV1::new().compute(&reference, &device)?.unsqueeze(0)?;
-            let spks = load_voice_print(&args, &reference, &device)?.unsqueeze(0)?;
+            let ref_wav = read_wav_16k(&reference)?;
+            let prompt_mel = MelV1::new().compute(&ref_wav, &device)?.unsqueeze(0)?;
+            let spks = load_voice_print(&args, &ckpt, &ref_wav, &device)?.unsqueeze(0)?;
             (
                 Models::MeanVc {
                     model: Box::new(model),
@@ -1146,9 +1196,9 @@ fn main() -> anyhow::Result<()> {
         }
         EngineKind::Xvc => {
             let xdev = xvc_device(args.cpu);
-            let xeng = xvc::XvcEngine::load("ckpt", &xdev)
+            let xeng = xvc::XvcEngine::load(&ckpt, &xdev)
                 .map_err(|e| anyhow::anyhow!("cannot load the X-VC engine: {e}"))?;
-            let raw: Vec<f64> = read_wav_16k(&args.reference)?
+            let raw: Vec<f64> = read_wav_16k(&reference)?
                 .iter()
                 .map(|&s| s as f64)
                 .collect();
@@ -1165,10 +1215,10 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "seedvc")]
         EngineKind::SeedVc => {
             let sdev = xvc_device(args.cpu);
-            let seng = seedvc::pipeline::SeedVcEngine::load("ckpt", &sdev)
+            let seng = seedvc::pipeline::SeedVcEngine::load(&ckpt, &sdev)
                 .map_err(|e| anyhow::anyhow!("cannot load the Seed-VC engine: {e}"))?;
             // The engine world is 22 050 Hz; accept any wav rate.
-            let mut r = hound::WavReader::open(&args.reference)?;
+            let mut r = hound::WavReader::open(&reference)?;
             let spec = r.spec();
             let raw: Vec<f32> = match spec.sample_format {
                 hound::SampleFormat::Int => {
@@ -1352,7 +1402,7 @@ fn main() -> anyhow::Result<()> {
     // should have. Engine-agnostic — read at native rate, resampled to
     // the 48 kHz analysis domain.
     let profile_eq = {
-        let mut r = hound::WavReader::open(&args.reference)?;
+        let mut r = hound::WavReader::open(&reference)?;
         let spec = r.spec();
         let raw: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Int => {
