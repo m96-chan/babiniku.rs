@@ -50,7 +50,7 @@ cargo install --git https://github.com/m96-chan/babiniku.rs babiniku --features 
 
 `babiniku --version` prints the compiled feature set (and the GPL notice on `seedvc` builds), so a build's flavor is always auditable.
 
-An installed binary looks for checkpoints in the platform data directory — `~/.local/share/babiniku/ckpt` (Linux, honoring `$XDG_DATA_HOME`), `~/Library/Application Support/babiniku/ckpt` (macOS), `%APPDATA%\babiniku\ckpt` (Windows) — overridable with `--ckpt-dir <dir>` or `BABINIKU_CKPT_DIR`; from a repo checkout, `./ckpt` keeps working as before. Checkpoint setup per engine: [docs/meanvc.md](docs/meanvc.md) · [docs/xvc.md](docs/xvc.md) · [docs/seedvc.md](docs/seedvc.md) (a `babiniku-fetch` downloader is planned, [#65](https://github.com/m96-chan/babiniku.rs/issues/65)).
+An installed binary looks for checkpoints in the platform data directory — `~/.local/share/babiniku/ckpt` (Linux, honoring `$XDG_DATA_HOME`), `~/Library/Application Support/babiniku/ckpt` (macOS), `%APPDATA%\babiniku\ckpt` (Windows) — overridable with `--ckpt-dir <dir>` or `BABINIKU_CKPT_DIR`; from a repo checkout, `./ckpt` keeps working as before. Checkpoint setup per engine: [docs/meanvc.md](docs/meanvc.md) · [docs/xvc.md](docs/xvc.md) · [docs/seedvc.md](docs/seedvc.md) — for Seed-VC, `babiniku-fetch seedvc` downloads and converts everything in one Rust command ([#65](https://github.com/m96-chan/babiniku.rs/issues/65); meanvc/xvc fetchers tracked there).
 
 Publishing to crates.io is blocked on the candle-fork **git dependency** (crates.io forbids git deps) until the forward-AD patch is upstreamed ([#10](https://github.com/m96-chan/babiniku.rs/issues/10)); until then every crate stays `publish = false` and `--git` is the way.
 
