@@ -86,6 +86,10 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
 
+## Contributing
+
+Fork + pull request only — see [CONTRIBUTING.md](CONTRIBUTING.md) (issue-first, TDD, demo-before-push; **no code as issue attachments**).
+
 ## License
 
-MIT OR Apache-2.0, at your option — except [`crates/seedvc`](crates/seedvc), which is **GPL-3.0** (upstream code and weights) and strictly opt-in: binaries built without the `seedvc` cargo feature carry no GPL obligations. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Header/avatar artwork: a personal modification of a model by [こまど (Komado)](https://drive.google.com/file/d/1DuVNYmahJTelmDbZ1RVXXKQ7wuYPYy3u/view) — shown for illustration only; all rights to the original model belong to its creator.
+MIT OR Apache-2.0, at your option — except [`crates/seedvc`](crates/seedvc), which is **GPL-3.0** (upstream code and weights) and strictly opt-in: binaries built without the `seedvc` cargo feature carry no GPL obligations. Model weights belong to their original authors ([ASLP-lab/MeanVC](https://github.com/ASLP-lab/MeanVC) et al.). The avatar above is the maintainer's own — bring yours. Header/avatar artwork: a personal modification of a model by [こまど (Komado)](https://komado.booth.pm/items) — shown for illustration only; all rights to the original model belong to its creator.
