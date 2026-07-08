@@ -69,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use babiniku::audio::{self, AudioBackend};
 use candle_core::{Device, Tensor};
 use meanvc2::backends::{FastU2pp, FastU2ppConfig, Vocos, VocosConfig};
 use meanvc2::encoders::Vocoder;
@@ -77,7 +78,6 @@ use nnnoiseless::DenoiseState;
 use signalsmith_stretch::Stretch;
 use std::sync::atomic::AtomicI32;
 use vc_core::bwe::{Exciter, Upsampler3x};
-use babiniku::audio::{self, AudioBackend};
 use xvc::preprocess::HighpassBiquad;
 
 const SR: usize = 16_000;
@@ -279,9 +279,7 @@ fn parse_args() -> Args {
                 }
                 std::process::exit(0);
             }
-            "--ckpt-dir" => {
-                a.ckpt_dir = Some(it.next().unwrap_or_else(|| die("--ckpt-dir <dir>")))
-            }
+            "--ckpt-dir" => a.ckpt_dir = Some(it.next().unwrap_or_else(|| die("--ckpt-dir <dir>"))),
             "--engine" => {
                 a.engine = match it.next().as_deref() {
                     Some("meanvc") => EngineKind::MeanVc,
@@ -305,7 +303,10 @@ fn parse_args() -> Args {
                 a.reference = Some(it.next().unwrap_or_else(|| die("--reference <wav>")))
             }
             "--voice-print" => {
-                a.voice_print = Some(it.next().unwrap_or_else(|| die("--voice-print <safetensors>")))
+                a.voice_print = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--voice-print <safetensors>")),
+                )
             }
             "--wav" => a.wav = Some(it.next().unwrap_or_else(|| die("--wav <file>"))),
             "--out" => a.out = Some(it.next().unwrap_or_else(|| die("--out <file>"))),
@@ -313,21 +314,27 @@ fn parse_args() -> Args {
             "--low-latency" => a.low_latency = true,
             "--window-ms" => {
                 a.window_ms = Some(
-                    it.next().unwrap_or_else(|| die("--window-ms <ms>"))
-                        .parse().unwrap_or_else(|_| die("--window-ms takes an integer")),
+                    it.next()
+                        .unwrap_or_else(|| die("--window-ms <ms>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--window-ms takes an integer")),
                 )
             }
             #[cfg(feature = "seedvc")]
             "--cfm-steps" => {
                 a.cfm_steps = Some(
-                    it.next().unwrap_or_else(|| die("--cfm-steps <n>"))
-                        .parse().unwrap_or_else(|_| die("--cfm-steps takes an integer")),
+                    it.next()
+                        .unwrap_or_else(|| die("--cfm-steps <n>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--cfm-steps takes an integer")),
                 )
             }
             "--hop-ms" => {
                 a.hop_ms = Some(
-                    it.next().unwrap_or_else(|| die("--hop-ms <ms>"))
-                        .parse().unwrap_or_else(|_| die("--hop-ms takes an integer")),
+                    it.next()
+                        .unwrap_or_else(|| die("--hop-ms <ms>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--hop-ms takes an integer")),
                 )
             }
             "--cpu" => a.cpu = true,
@@ -342,13 +349,17 @@ fn parse_args() -> Args {
             }
             "--profile-eq" => {
                 a.profile_eq = it
-                    .next().unwrap_or_else(|| die("--profile-eq <0-100>"))
-                    .parse().unwrap_or_else(|_| die("--profile-eq takes an integer"));
+                    .next()
+                    .unwrap_or_else(|| die("--profile-eq <0-100>"))
+                    .parse()
+                    .unwrap_or_else(|_| die("--profile-eq takes an integer"));
             }
             "--out-denoise" => {
                 a.out_denoise = it
-                    .next().unwrap_or_else(|| die("--out-denoise <0-100>"))
-                    .parse().unwrap_or_else(|_| die("--out-denoise takes an integer"));
+                    .next()
+                    .unwrap_or_else(|| die("--out-denoise <0-100>"))
+                    .parse()
+                    .unwrap_or_else(|_| die("--out-denoise takes an integer"));
             }
             "--denoise-mix" => {
                 a.denoise_mix = it
@@ -368,8 +379,12 @@ fn parse_args() -> Args {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| die("--gate <dBFS, e.g. -45>"))
             }
-            "--input-device" => a.input_device = Some(it.next().unwrap_or_else(|| die("--input-device <source>"))),
-            "--output-device" => a.output_device = Some(it.next().unwrap_or_else(|| die("--output-device <name>"))),
+            "--input-device" => {
+                a.input_device = Some(it.next().unwrap_or_else(|| die("--input-device <source>")))
+            }
+            "--output-device" => {
+                a.output_device = Some(it.next().unwrap_or_else(|| die("--output-device <name>")))
+            }
             "--duration" => a.duration = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown flag {other}");
@@ -1417,8 +1432,7 @@ fn main() -> anyhow::Result<()> {
                 .step_by(spec.channels as usize)
                 .collect::<Result<_, _>>()?,
         };
-        let ref48 =
-            vc_core::profile::resample_analysis(&raw, spec.sample_rate as usize, 48_000);
+        let ref48 = vc_core::profile::resample_analysis(&raw, spec.sample_rate as usize, 48_000);
         vc_core::profile::ProfileEq::new(&ref48, spec.sample_rate as f32)
     };
 
@@ -1498,12 +1512,14 @@ fn main() -> anyhow::Result<()> {
                     c48 = shifted;
                 }
                 leveler.process(&mut c48);
-                let eq_wet =
-                    controls_out.profile_eq.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                let eq_wet = controls_out
+                    .profile_eq
+                    .load(Ordering::Relaxed)
+                    .clamp(0, 100) as f32
+                    / 100.0;
                 profile_eq.observe(&c48);
                 profile_eq.process(&mut c48, eq_wet);
-                let wet =
-                    controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+                let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
                 exciter.process(&mut c48, wet);
                 limiter.process(&mut c48);
                 {
@@ -1529,7 +1545,9 @@ fn main() -> anyhow::Result<()> {
                 OutMsg::Mel(mel) => {
                     // Vocoding with a mel tail as left context (MeanVC
                     // only; the X-VC engine decodes to waveform itself).
-                    let vocos = vocos.as_ref().unwrap_or_else(|| die("Mel chunks require the vocoder"));
+                    let vocos = vocos
+                        .as_ref()
+                        .unwrap_or_else(|| die("Mel chunks require the vocoder"));
                     let t0 = Instant::now();
                     let mel_win = match &mel_tail {
                         Some(tail) => Tensor::cat(&[tail, &mel], 1)?,
@@ -1586,8 +1604,11 @@ fn main() -> anyhow::Result<()> {
             // the wet knob is open (0 % = bit-exact bypass).
             chunk48.clear();
             upsampler.process(&chunk, &mut chunk48);
-            let eq_wet =
-                controls_out.profile_eq.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;
+            let eq_wet = controls_out
+                .profile_eq
+                .load(Ordering::Relaxed)
+                .clamp(0, 100) as f32
+                / 100.0;
             profile_eq.observe(&chunk48);
             profile_eq.process(&mut chunk48, eq_wet);
             let wet = controls_out.bwe_wet.load(Ordering::Relaxed).clamp(0, 100) as f32 / 100.0;

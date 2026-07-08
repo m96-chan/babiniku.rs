@@ -34,10 +34,7 @@ pub fn version_line() -> String {
     } else {
         features.join(", ")
     };
-    format!(
-        "babiniku {} (features: {list})",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("babiniku {} (features: {list})", env!("CARGO_PKG_VERSION"))
 }
 
 /// License notice for GPL builds: `Some` iff the `seedvc` feature is

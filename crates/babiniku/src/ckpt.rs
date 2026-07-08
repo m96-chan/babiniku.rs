@@ -129,7 +129,10 @@ mod tests {
 
     #[test]
     fn linux_default_is_xdg_data_home() {
-        let env = env_of(&[("XDG_DATA_HOME", "/home/alice/xdg"), ("HOME", "/home/alice")]);
+        let env = env_of(&[
+            ("XDG_DATA_HOME", "/home/alice/xdg"),
+            ("HOME", "/home/alice"),
+        ]);
         let got = resolve_from(None, &env, false, "linux");
         assert_eq!(got, PathBuf::from("/home/alice/xdg/babiniku/ckpt"));
     }
