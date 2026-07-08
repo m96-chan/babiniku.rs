@@ -1,0 +1,18 @@
+[package]
+name = "babiniku-fetch"
+description = "Checkpoint fetcher/converter: downloads official weights from Hugging Face and converts them to the fp32 safetensors the engines load — no Python required"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "babiniku-fetch"
+path = "src/main.rs"
+
+[dependencies]
+candle-core = { workspace = true }
+hf-hub = "0.4"
+anyhow = "1"

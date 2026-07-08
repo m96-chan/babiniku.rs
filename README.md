@@ -111,6 +111,7 @@ The repo is a cargo workspace — one crate per engine on a shared foundation:
 | [`crates/babiniku`](crates/babiniku) | The `babiniku` real-time TUI / virtual-mic binary, plus the per-platform audio backends (`babiniku::audio`: Pulse on Linux, cpal/WASAPI/CoreAudio elsewhere) and the `audio_probe` example |
 | [`crates/xvc`](crates/xvc) | X-VC engine: GLM-4-Voice tokenizer, ERes2Net, SAC codec, prenet, MMDiT converter + the `XvcEngine` offline/streaming pipeline ([#30](https://github.com/m96-chan/babiniku.rs/issues/30)) |
 | [`crates/seedvc`](crates/seedvc) | Seed-VC engine (**GPL-3.0**, feature-gated): Whisper-small content, CAM++ speaker, DiT+WaveNet CFM, BigVGAN + `SeedVcEngine`/`SeedVcStream` ([#50](https://github.com/m96-chan/babiniku.rs/issues/50)) |
+| [`crates/fetch`](crates/fetch) | `babiniku-fetch`: downloads official weights from Hugging Face and converts them to the engines' fp32 safetensors — **no Python needed** ([#65](https://github.com/m96-chan/babiniku.rs/issues/65); seedvc today, meanvc/xvc tracked there) |
 
 Checkpoints stay at the repo root (`ckpt/`), as do `tools/` and `docs/`.
 
