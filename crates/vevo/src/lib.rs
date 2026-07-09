@@ -20,3 +20,4 @@ pub use vc_core::{Error, Result};
 
 pub mod hubert;
 pub mod mel;
+pub mod repcodec;
