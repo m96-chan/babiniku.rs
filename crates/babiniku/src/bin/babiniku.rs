@@ -92,6 +92,9 @@ const XVC_CHUNK_SAMPLES: usize = 3_840;
 /// range is 250–300 ms; 320 keeps whole 20 ms frames).
 #[cfg(feature = "seedvc")]
 const SEEDVC_CHUNK_SAMPLES: usize = 5_120;
+/// CosyVoice2 live block (1.0 s at 16 kHz = 25 tokens, matching the
+/// model's own training `chunk_size` — see `cosyvoice::stream`).
+const COSYVOICE_CHUNK_SAMPLES: usize = 16_000;
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
@@ -127,6 +130,7 @@ enum EngineKind {
     Xvc,
     #[cfg(feature = "seedvc")]
     SeedVc,
+    CosyVoice,
 }
 
 impl EngineKind {
@@ -136,6 +140,7 @@ impl EngineKind {
             EngineKind::Xvc => "xvc",
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => "seedvc",
+            EngineKind::CosyVoice => "cosyvoice",
         }
     }
 
@@ -146,6 +151,7 @@ impl EngineKind {
             EngineKind::Xvc => XVC_CHUNK_SAMPLES,
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => SEEDVC_CHUNK_SAMPLES,
+            EngineKind::CosyVoice => COSYVOICE_CHUNK_SAMPLES,
         }
     }
 
@@ -156,6 +162,7 @@ impl EngineKind {
             EngineKind::Xvc => ["semantic", "convert", "decode"],
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => ["content", "cfm", "vocoder"],
+            EngineKind::CosyVoice => ["tokenizer", "flow+cfm", "hift"],
         }
     }
 }
@@ -221,6 +228,15 @@ struct Args {
     /// quality per hop, fewer = more real-time headroom).
     #[cfg(feature = "seedvc")]
     cfm_steps: Option<usize>,
+    /// CosyVoice2 streaming left-context override, in seconds (default
+    /// 3.0). More context can stabilize speaker conditioning on
+    /// harder (fast/expressive/less clearly voiced) material at
+    /// roughly proportional extra compute per hop — field-tested
+    /// mixed results, not a guaranteed win (see docs/cosyvoice.md).
+    cosyvoice_context_s: Option<f32>,
+    /// CosyVoice2 streaming crossfade override, in milliseconds
+    /// (default 80).
+    cosyvoice_crossfade_ms: Option<f32>,
     /// X-VC hop override (ms). Smaller hops shrink both the audible
     /// needle probability (the emitted slice is a smaller fraction of
     /// the window) and the algorithmic latency, at proportionally more
@@ -264,6 +280,8 @@ fn parse_args() -> Args {
         hop_ms: None,
         #[cfg(feature = "seedvc")]
         cfm_steps: None,
+        cosyvoice_context_s: None,
+        cosyvoice_crossfade_ms: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -286,11 +304,12 @@ fn parse_args() -> Args {
                     Some("xvc") => EngineKind::Xvc,
                     #[cfg(feature = "seedvc")]
                     Some("seedvc") => EngineKind::SeedVc,
+                    Some("cosyvoice") => EngineKind::CosyVoice,
                     other => {
                         eprintln!(
-                            "--engine must be meanvc or xvc{} (got {other:?})",
+                            "--engine must be meanvc, xvc, or cosyvoice{} (got {other:?})",
                             if cfg!(feature = "seedvc") {
-                                " or seedvc"
+                                ", or seedvc"
                             } else {
                                 ""
                             }
@@ -327,6 +346,22 @@ fn parse_args() -> Args {
                         .unwrap_or_else(|| die("--cfm-steps <n>"))
                         .parse()
                         .unwrap_or_else(|_| die("--cfm-steps takes an integer")),
+                )
+            }
+            "--cosyvoice-context-s" => {
+                a.cosyvoice_context_s = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--cosyvoice-context-s <seconds, e.g. 3.0>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--cosyvoice-context-s takes a number")),
+                )
+            }
+            "--cosyvoice-crossfade-ms" => {
+                a.cosyvoice_crossfade_ms = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--cosyvoice-crossfade-ms <ms, e.g. 80>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--cosyvoice-crossfade-ms takes a number")),
                 )
             }
             "--hop-ms" => {
@@ -396,10 +431,9 @@ fn parse_args() -> Args {
 }
 
 /// In-process RNNoise at its native 48 kHz, for the OUTPUT side of the
-/// Seed-VC path (field report: a faint noise bed under the converted
-/// voice — diffusion residual — that output NR should scrub). Wet/dry
-/// mix so the air of the voice can be kept.
-#[cfg(feature = "seedvc")]
+/// Seed-VC / CosyVoice2 paths (field report: a faint noise bed under the
+/// converted voice — diffusion residual — that output NR should scrub).
+/// Wet/dry mix so the air of the voice can be kept.
 struct Rnnoise48k {
     state: Box<DenoiseState<'static>>,
     /// Carry so chunks need not align to the 480-sample frames.
@@ -407,7 +441,6 @@ struct Rnnoise48k {
     out: Vec<f32>,
 }
 
-#[cfg(feature = "seedvc")]
 impl Rnnoise48k {
     fn new() -> Self {
         Self {
@@ -730,10 +763,10 @@ fn xvc_device(_force_cpu: bool) -> Device {
 enum OutMsg {
     Mel(Tensor),
     Raw(Vec<f32>),
-    /// Already at the 48 kHz output rate (Seed-VC path: BigVGAN gives
-    /// real bandwidth up to 11 kHz, so the 16→48 upsampler and pitch
-    /// stage are bypassed; exciter/leveler/limiter still apply).
-    #[cfg(feature = "seedvc")]
+    /// Already at the 48 kHz output rate (Seed-VC / CosyVoice2 paths:
+    /// both engines decode above 16 kHz natively — BigVGAN and HiFT
+    /// respectively — so the 16→48 upsampler and pitch stage are
+    /// bypassed; exciter/leveler/limiter still apply).
     Raw48(Vec<f32>),
 }
 
@@ -757,6 +790,12 @@ enum Models {
         /// Reference audio at 22 050 Hz (conditions are precomputed by
         /// the stream itself).
         ref_22k: Vec<f32>,
+    },
+    CosyVoice {
+        engine: std::sync::Arc<cosyvoice::CosyVoiceEngine>,
+        /// Reference audio at 16 kHz (the stream computes tokens/
+        /// embedding/feat once at open time).
+        ref_16k: Vec<f32>,
     },
 }
 
@@ -902,6 +941,186 @@ fn run_seedvc_conversion(
             }
             let _ = tx_out.send(OutMsg::Raw48(out48));
         }
+    }
+    Ok(())
+}
+
+/// CosyVoice2 live conversion (issue #75): sliding-window re-conversion
+/// per 1.0 s block (`cosyvoice::stream::CosyVoiceStream`), soft-gate
+/// expander in front like the Seed-VC/X-VC paths, deep silence
+/// hard-skipped. Unlike the official (offline-source) streaming mode,
+/// this re-tokenizes and re-renders a sliding window from scratch every
+/// hop and crossfades the seam — see `cosyvoice::stream` module docs for
+/// why the official incremental scheme doesn't apply to live mic input.
+/// Emits 24 kHz blocks via `OutMsg::Raw48` (named for the pipeline's
+/// output rate, not literally 48 kHz — the output thread treats any
+/// engine-native rate above 16 kHz the same way as the Seed-VC path).
+#[allow(clippy::too_many_arguments)]
+fn run_cosyvoice_conversion(
+    engine: std::sync::Arc<cosyvoice::CosyVoiceEngine>,
+    ref_16k: Vec<f32>,
+    context_s: Option<f32>,
+    crossfade_ms: Option<f32>,
+    mic_input: bool,
+    rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
+    tx_out: std::sync::mpsc::SyncSender<OutMsg>,
+    stats: Arc<Mutex<Stats>>,
+    run: Arc<AtomicBool>,
+    controls: Arc<Controls>,
+) -> anyhow::Result<()> {
+    let mut cfg = cosyvoice::StreamConfig::default();
+    if let Some(s) = context_s {
+        // Round to the nearest whole token (640 samples @ 16 kHz) like
+        // the block/context invariant `stream()` asserts.
+        let samples = (s * SR as f32) as usize;
+        cfg.context = (samples / 640).max(1) * 640;
+    }
+    if let Some(ms) = crossfade_ms {
+        cfg.crossfade_24k = ((ms / 1000.0) * cosyvoice::MEL_SR as f32) as usize;
+    }
+    let hop_s = cfg.block as f32 / SR as f32;
+    stats.lock().unwrap().engine_info = format!(
+        "block {} ms · ctx {:.1} s · crossfade {} ms",
+        cfg.block * 1000 / SR,
+        cfg.context as f32 / SR as f32,
+        cfg.crossfade_24k * 1000 / cosyvoice::MEL_SR as usize,
+    );
+    let mut stream = engine
+        .stream(&ref_16k, SR as u32, cfg)
+        .map_err(|e| anyhow::anyhow!("cosyvoice reference prep: {e}"))?;
+    let mut norm = MicVolumeNormalizer::new();
+    let mut hp = HighpassBiquad::new(SR as f64, 40.0);
+    let mut expander = SoftExpander::new(SR as f32);
+    // .max(1) wraps the whole quotient, not just the divisor: with the
+    // 1.0 s block (vs Seed-VC's 320 ms), 960/1000 and 480/1000 both floor
+    // to 0, which made `deep_for >= deep_chunks` (0) permanently true —
+    // every chunk read as deep silence and no hop ever rendered.
+    let hangover: u32 = ((480 / (cfg.block * 1000 / SR).max(1)) as u32).max(1);
+    let deep_chunks: u32 = ((960 / (cfg.block * 1000 / SR).max(1)) as u32).max(1);
+    let mut open_for = 0u32;
+    let mut deep_for = 0u32;
+    let mut hops = 0u64;
+    let mut was_passthrough = false;
+    let mut prev_gated = false;
+
+    while run.load(Ordering::Relaxed) {
+        let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(_) => continue,
+        };
+        let passthrough = stats.lock().unwrap().passthrough;
+        let in_level = rms(&chunk);
+        if passthrough {
+            was_passthrough = true;
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.out_rms = in_level;
+            st.chunks += 1;
+            drop(st);
+            let _ = tx_out.send(OutMsg::Raw(chunk));
+            continue;
+        }
+        if was_passthrough {
+            stream = engine
+                .stream(&ref_16k, SR as u32, cfg)
+                .map_err(|e| anyhow::anyhow!("cosyvoice stream restart: {e}"))?;
+            hp = HighpassBiquad::new(SR as f64, 40.0);
+            expander = SoftExpander::new(SR as f32);
+            was_passthrough = false;
+            prev_gated = false;
+        }
+
+        let gate = controls.gate_db.load(Ordering::Relaxed);
+        let db = 20.0 * in_level.max(1e-9).log10();
+        if db >= gate as f32 {
+            open_for = hangover + 1;
+        }
+        open_for = open_for.saturating_sub(1);
+        if db < gate as f32 - 18.0 {
+            deep_for += 1;
+        } else {
+            deep_for = 0;
+        }
+        let gated = deep_for >= deep_chunks;
+
+        let mut prepared: Vec<f32> = if mic_input {
+            let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
+            norm.process(&mut c64);
+            hp.process(&mut c64);
+            c64.iter().map(|&s| s as f32).collect()
+        } else {
+            chunk.clone()
+        };
+        expander.process(&mut prepared, open_for > 0);
+
+        // Splice fade at hard-gate transitions (same pattern as the X-VC
+        // path): fading the model's INPUT lets the flow/HiFT settle
+        // toward silence smoothly on the edge chunk, instead of jumping
+        // straight from converted audio to a digital-zero block — with
+        // CosyVoice2's 1.0 s block granularity (vs X-VC's 240 ms /
+        // Seed-VC's 320 ms) an unfaded hard mute is a full second of
+        // audible pop, not a click.
+        const SPLICE_FADE: usize = 1_600; // 100 ms at 16 kHz
+        let entering_gate = gated && !prev_gated;
+        let leaving_gate = !gated && prev_gated;
+        prev_gated = gated;
+        if entering_gate {
+            stats.lock().unwrap().splices += 1;
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = 1.0 - i as f32 / n as f32;
+                *s *= w * w;
+            }
+        } else if leaving_gate {
+            let n = SPLICE_FADE.min(prepared.len());
+            for (i, s) in prepared.iter_mut().take(n).enumerate() {
+                let w = i as f32 / n as f32;
+                *s *= w * w;
+            }
+        }
+
+        {
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.chunks += 1;
+            if gated {
+                st.gated += 1;
+            }
+        }
+        // Steady-state deep silence (not the fade-out edge): skip the
+        // model entirely, emit true zeros at the engine's native output
+        // rate. The edge chunk (entering_gate) still runs through the
+        // model below so the fade above actually reaches the speaker.
+        if gated && !entering_gate {
+            let n = prepared.len() * cosyvoice::MEL_SR as usize / SR;
+            let _ = tx_out.send(OutMsg::Raw48(vec![0.0; n]));
+            continue;
+        }
+        stream.push(&prepared, SR as u32);
+        while stream.ready() {
+            let t0 = Instant::now();
+            let Some(out) = stream
+                .step()
+                .map_err(|e| anyhow::anyhow!("cosyvoice step: {e}"))?
+            else {
+                break;
+            };
+            let dt = t0.elapsed().as_secs_f32();
+            hops += 1;
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_vc = dt / hop_s;
+                // Warm-up grace like the Seed-VC/X-VC drain: the first
+                // hops absorb one-off CUDA kernel/allocator costs.
+                if dt > hop_s && hops > 4 {
+                    st.late += 1;
+                }
+            }
+            let _ = tx_out.send(OutMsg::Raw48(out));
+        }
+    }
+    if let Some(tail) = stream.finish() {
+        let _ = tx_out.send(OutMsg::Raw48(tail));
     }
     Ok(())
 }
@@ -1261,6 +1480,19 @@ fn main() -> anyhow::Result<()> {
                 None,
             )
         }
+        EngineKind::CosyVoice => {
+            let cdev = xvc_device(args.cpu);
+            let ceng = cosyvoice::CosyVoiceEngine::load(&ckpt, &cdev)
+                .map_err(|e| anyhow::anyhow!("cannot load the CosyVoice2 engine: {e}"))?;
+            let ref_16k = read_wav_16k(&reference)?;
+            (
+                Models::CosyVoice {
+                    engine: std::sync::Arc::new(ceng),
+                    ref_16k,
+                },
+                None,
+            )
+        }
     };
 
     // Ctrl-C / SIGTERM funnels into the same shutdown path as `q`, so the
@@ -1344,10 +1576,12 @@ fn main() -> anyhow::Result<()> {
                 let raw: Vec<f64> = read_wav_16k(path)?.iter().map(|&s| s as f64).collect();
                 xvc::preprocess::preprocess(&raw, &Default::default())
             }
-            // Seed-VC file input needs no offline preprocessing: the
-            // stream handles rates internally from 16 kHz chunks.
+            // Seed-VC / CosyVoice2 file input need no offline
+            // preprocessing: the stream handles rates internally from
+            // 16 kHz chunks.
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => read_wav_16k(path)?,
+            EngineKind::CosyVoice => read_wav_16k(path)?,
         }),
     };
     let mic_input = wav_samples.is_none();
@@ -1448,12 +1682,9 @@ fn main() -> anyhow::Result<()> {
         let mut profile_eq = profile_eq;
         let mut stretch = Stretch::preset_default(1, SR as u32);
         let mut current_semi = 0f32;
-        // Second shifter for the 48 kHz direct path (Seed-VC).
-        #[cfg(feature = "seedvc")]
+        // Second shifter for the 48 kHz direct path (Seed-VC / CosyVoice2).
         let mut stretch48 = Stretch::preset_default(1, OUT_SR as u32);
-        #[cfg(feature = "seedvc")]
         let mut rnnoise48 = Rnnoise48k::new();
-        #[cfg(feature = "seedvc")]
         let mut current_semi48 = 0f32;
         // Bandwidth extension (issue #42): exact ×3 upsampling to 48 kHz
         // plus the optional harmonic exciter, after the pitch shifter.
@@ -1487,7 +1718,6 @@ fn main() -> anyhow::Result<()> {
             let Ok(msg) = rx_out.recv_timeout(Duration::from_millis(300)) else {
                 continue;
             };
-            #[cfg(feature = "seedvc")]
             if let OutMsg::Raw48(c) = &msg {
                 let mut c48 = c.clone();
                 // Output NR before the leveler, so the diffusion noise
@@ -1540,7 +1770,6 @@ fn main() -> anyhow::Result<()> {
             }
             let chunk: Vec<f32> = match msg {
                 OutMsg::Raw(c) => c,
-                #[cfg(feature = "seedvc")]
                 OutMsg::Raw48(_) => unreachable!("handled above"),
                 OutMsg::Mel(mel) => {
                     // Vocoding with a mel tail as left context (MeanVC
@@ -1636,6 +1865,8 @@ fn main() -> anyhow::Result<()> {
     let xvc_cross_check = !args.low_latency;
     #[cfg(feature = "seedvc")]
     let seedvc_cfm_steps = args.cfm_steps;
+    let cosyvoice_context_s = args.cosyvoice_context_s;
+    let cosyvoice_crossfade_ms = args.cosyvoice_crossfade_ms;
     // Window default per device (issue #42 knee search): CUDA absorbs
     // the official 2400 ms window (~4x fewer decoder needles, worst hop
     // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
@@ -1679,6 +1910,20 @@ fn main() -> anyhow::Result<()> {
                     xvc_cross_check,
                     xvc_window_ms,
                     xvc_hop_ms,
+                );
+            }
+            Models::CosyVoice { engine, ref_16k } => {
+                return run_cosyvoice_conversion(
+                    engine,
+                    ref_16k,
+                    cosyvoice_context_s,
+                    cosyvoice_crossfade_ms,
+                    mic_input,
+                    rx_in,
+                    tx_out,
+                    stats_vc,
+                    run_vc,
+                    controls_vc,
                 );
             }
             Models::MeanVc {
