@@ -97,9 +97,12 @@ Steady state on CUDA: **~0.25 s per 0.32 s block** at 6 CFM steps
 ## Usage
 
 ```sh
-# one-time: convert the official checkpoints (inside a seed-vc clone's env)
-python tools/convert_seedvc.py --seedvc-dir <seed-vc clone> --out ckpt
-# → ckpt/seedvc_{dit,regulator,campplus,bigvgan,whisper}.safetensors (~1.2 GB fp32)
+# one-time: fetch + convert the official checkpoints (pure Rust, no Python)
+cargo run --release -p babiniku-fetch -- seedvc
+# → ckpt/seedvc_{dit,regulator,campplus,bigvgan,whisper}.safetensors (~1.2 GB fp32);
+#   downloads from Hugging Face with a GPL confirmation prompt (--yes to skip).
+#   Alternative from a local seed-vc clone's Python env:
+#   python tools/convert_seedvc.py --seedvc-dir <clone> --out ckpt
 
 # build + run (GPL build!)
 cargo run --release -p babiniku --features cuda,seedvc --bin babiniku -- \
