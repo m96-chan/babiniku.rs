@@ -23,6 +23,10 @@ required-features = ["seedvc"]
 name = "seedvc_finetune_ab"
 required-features = ["seedvc"]
 
+[[example]]
+name = "seedvc_mel_probe"
+required-features = ["seedvc"]
+
 [dependencies]
 # GPL-3.0 engine, strictly opt-in: binaries built WITHOUT the `seedvc`
 # feature carry no GPL obligations (see crates/seedvc/Cargo.toml).
