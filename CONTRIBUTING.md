@@ -42,7 +42,8 @@ cargo fmt
 - Checkpoints (`ckpt/`) are optional for most development — parity
   ("golden") tests are skip-if-absent. Engine docs
   ([meanvc](docs/meanvc.md), [xvc](docs/xvc.md),
-  [seedvc](docs/seedvc.md)) describe checkpoint setup where needed.
+  [seedvc](docs/seedvc.md), [cosyvoice](docs/cosyvoice.md),
+  [vevo](docs/vevo.md)) describe checkpoint setup where needed.
 
 ## Where things live
 
@@ -52,6 +53,8 @@ cargo fmt
 | MeanVC v1/v2 | `crates/meanvc` — label `meanvc` / `meanvc2` |
 | X-VC | `crates/xvc` — label `xvc` |
 | Seed-VC (**GPL-3.0**, feature-gated) | `crates/seedvc` — label `seedvc` |
+| CosyVoice2 (**Apache-2.0**, default build) | `crates/cosyvoice` — label `cosyvoice` |
+| Vevo-Timbre (code **MIT/Apache-2.0**, weights **CC-BY-NC-4.0**) | `crates/vevo` — label `vevo` |
 | TUI app + audio backends | `crates/babiniku` — label `tui` |
 | Tooling / CI / packaging | label `infra` |
 

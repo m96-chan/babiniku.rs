@@ -95,6 +95,10 @@ const SEEDVC_CHUNK_SAMPLES: usize = 5_120;
 /// CosyVoice2 live block (1.0 s at 16 kHz = 25 tokens, matching the
 /// model's own training `chunk_size` — see `cosyvoice::stream`).
 const COSYVOICE_CHUNK_SAMPLES: usize = 16_000;
+/// Vevo-Timbre live block (320 ms at 16 kHz, matching
+/// `vevo::stream::StreamConfig::default().block`; see issue #77 for
+/// this port's current real-time status).
+const VEVO_CHUNK_SAMPLES: usize = 5_120;
 const FBANK_WINDOW: usize = 400; // kaldi 25 ms frame
 const FBANK_SHIFT: usize = 160; // kaldi 10 ms shift
 const BNF_CHUNK: usize = 5; // subsampled BNF frames per CARD chunk
@@ -131,6 +135,7 @@ enum EngineKind {
     #[cfg(feature = "seedvc")]
     SeedVc,
     CosyVoice,
+    Vevo,
 }
 
 impl EngineKind {
@@ -141,6 +146,7 @@ impl EngineKind {
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => "seedvc",
             EngineKind::CosyVoice => "cosyvoice",
+            EngineKind::Vevo => "vevo",
         }
     }
 
@@ -152,6 +158,7 @@ impl EngineKind {
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => SEEDVC_CHUNK_SAMPLES,
             EngineKind::CosyVoice => COSYVOICE_CHUNK_SAMPLES,
+            EngineKind::Vevo => VEVO_CHUNK_SAMPLES,
         }
     }
 
@@ -163,6 +170,7 @@ impl EngineKind {
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => ["content", "cfm", "vocoder"],
             EngineKind::CosyVoice => ["tokenizer", "flow+cfm", "hift"],
+            EngineKind::Vevo => ["hubert+repcodec", "cfm", "vocos"],
         }
     }
 }
@@ -237,6 +245,11 @@ struct Args {
     /// CosyVoice2 streaming crossfade override, in milliseconds
     /// (default 80).
     cosyvoice_crossfade_ms: Option<f32>,
+    /// Vevo-Timbre CFM steps override (live default 6; more = higher
+    /// quality per hop, fewer = more real-time headroom — see #77 for
+    /// this port's current bottleneck, which is the vocoder, not the
+    /// step count).
+    vevo_steps: Option<usize>,
     /// X-VC hop override (ms). Smaller hops shrink both the audible
     /// needle probability (the emitted slice is a smaller fraction of
     /// the window) and the algorithmic latency, at proportionally more
@@ -282,6 +295,7 @@ fn parse_args() -> Args {
         cfm_steps: None,
         cosyvoice_context_s: None,
         cosyvoice_crossfade_ms: None,
+        vevo_steps: None,
         monitor: false,
         denoise: false,
         duration: None,
@@ -305,9 +319,10 @@ fn parse_args() -> Args {
                     #[cfg(feature = "seedvc")]
                     Some("seedvc") => EngineKind::SeedVc,
                     Some("cosyvoice") => EngineKind::CosyVoice,
+                    Some("vevo") => EngineKind::Vevo,
                     other => {
                         eprintln!(
-                            "--engine must be meanvc, xvc, or cosyvoice{} (got {other:?})",
+                            "--engine must be meanvc, xvc, cosyvoice, or vevo{} (got {other:?})",
                             if cfg!(feature = "seedvc") {
                                 ", or seedvc"
                             } else {
@@ -362,6 +377,14 @@ fn parse_args() -> Args {
                         .unwrap_or_else(|| die("--cosyvoice-crossfade-ms <ms, e.g. 80>"))
                         .parse()
                         .unwrap_or_else(|_| die("--cosyvoice-crossfade-ms takes a number")),
+                )
+            }
+            "--vevo-steps" => {
+                a.vevo_steps = Some(
+                    it.next()
+                        .unwrap_or_else(|| die("--vevo-steps <n, e.g. 6>"))
+                        .parse()
+                        .unwrap_or_else(|_| die("--vevo-steps takes a whole number")),
                 )
             }
             "--hop-ms" => {
@@ -797,6 +820,13 @@ enum Models {
         /// embedding/feat once at open time).
         ref_16k: Vec<f32>,
     },
+    Vevo {
+        engine: std::sync::Arc<vevo::pipeline::VevoEngine>,
+        /// Reference audio at 24 kHz (`VevoEngine`'s native rate; the
+        /// stream computes the reference's content-style codes and mel
+        /// prompt once at open time).
+        ref_24k: Vec<f32>,
+    },
 }
 
 /// The X-VC conversion loop: 240 ms input hops feed the 640/240/100/20
@@ -935,6 +965,139 @@ fn run_seedvc_conversion(
                 st.rtf_vc = dt / hop_s;
                 // Warm-up grace like the X-VC drain: the first hops
                 // absorb one-off CUDA kernel/allocator costs.
+                if dt > hop_s && hops > 4 {
+                    st.late += 1;
+                }
+            }
+            let _ = tx_out.send(OutMsg::Raw48(out48));
+        }
+    }
+    Ok(())
+}
+
+/// Vevo-Timbre live conversion (issue #74): sliding 0.5s-context +
+/// 320ms-block re-conversion (`vevo::stream::VevoStream`), soft-gate
+/// expander in front and deep silence hard-skipped like the Seed-VC
+/// path (the two engines share the same streaming shape — no
+/// length-regulation step, so there's no separate long/short context
+/// split). Emits genuine 48 kHz blocks (`Vocos` synthesizes at 24 kHz
+/// internally; the stream resamples up). **Not yet real-time** on this
+/// port — see `vevo::stream` module docs and issue #77: the vocoder,
+/// not the CFM step count, is the current bottleneck.
+#[allow(clippy::too_many_arguments)]
+fn run_vevo_conversion(
+    engine: std::sync::Arc<vevo::pipeline::VevoEngine>,
+    ref_24k: Vec<f32>,
+    steps: Option<usize>,
+    mic_input: bool,
+    rx_in: std::sync::mpsc::Receiver<Vec<f32>>,
+    tx_out: std::sync::mpsc::SyncSender<OutMsg>,
+    stats: Arc<Mutex<Stats>>,
+    run: Arc<AtomicBool>,
+    controls: Arc<Controls>,
+) -> anyhow::Result<()> {
+    let mut cfg = vevo::stream::StreamConfig::default();
+    if let Some(steps) = steps {
+        cfg.steps = steps;
+    }
+    let hop_s = cfg.block as f32 / SR as f32;
+    stats.lock().unwrap().engine_info = format!(
+        "block {} ms · ctx {:.1} s · cfm {} steps",
+        cfg.block * 1000 / SR,
+        cfg.context as f32 / SR as f32,
+        cfg.steps,
+    );
+    let mut stream = engine
+        .stream(&ref_24k, cfg)
+        .map_err(|e| anyhow::anyhow!("vevo reference prep: {e}"))?;
+    let mut norm = MicVolumeNormalizer::new();
+    let mut hp = HighpassBiquad::new(SR as f64, 40.0);
+    let mut expander = SoftExpander::new(SR as f32);
+    let hangover: u32 = (480 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let deep_chunks: u32 = (960 / (cfg.block * 1000 / SR).max(1)) as u32;
+    let mut open_for = 0u32;
+    let mut deep_for = 0u32;
+    let mut hops = 0u64;
+    let mut was_passthrough = false;
+
+    while run.load(Ordering::Relaxed) {
+        let chunk = match rx_in.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(_) => continue,
+        };
+        let passthrough = stats.lock().unwrap().passthrough;
+        let in_level = rms(&chunk);
+        if passthrough {
+            was_passthrough = true;
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.out_rms = in_level;
+            st.chunks += 1;
+            drop(st);
+            let _ = tx_out.send(OutMsg::Raw(chunk));
+            continue;
+        }
+        if was_passthrough {
+            stream = engine
+                .stream(&ref_24k, cfg)
+                .map_err(|e| anyhow::anyhow!("vevo stream restart: {e}"))?;
+            hp = HighpassBiquad::new(SR as f64, 40.0);
+            expander = SoftExpander::new(SR as f32);
+            was_passthrough = false;
+        }
+
+        let gate = controls.gate_db.load(Ordering::Relaxed);
+        let db = 20.0 * in_level.max(1e-9).log10();
+        if db >= gate as f32 {
+            open_for = hangover + 1;
+        }
+        open_for = open_for.saturating_sub(1);
+        if db < gate as f32 - 18.0 {
+            deep_for += 1;
+        } else {
+            deep_for = 0;
+        }
+        let gated = deep_for >= deep_chunks;
+
+        let mut prepared: Vec<f32> = if mic_input {
+            let mut c64: Vec<f64> = chunk.iter().map(|&s| s as f64).collect();
+            norm.process(&mut c64);
+            hp.process(&mut c64);
+            c64.iter().map(|&s| s as f32).collect()
+        } else {
+            chunk.clone()
+        };
+        expander.process(&mut prepared, open_for > 0);
+
+        {
+            let mut st = stats.lock().unwrap();
+            st.in_rms = in_level;
+            st.chunks += 1;
+            if gated {
+                st.gated += 1;
+            }
+        }
+        if gated {
+            // Deep silence: skip the model entirely, emit 48 kHz zeros.
+            let _ = tx_out.send(OutMsg::Raw48(vec![0.0; prepared.len() * 3]));
+            continue;
+        }
+        stream.push(&prepared);
+        while stream.ready() {
+            let t0 = Instant::now();
+            let Some(out48) = stream
+                .step()
+                .map_err(|e| anyhow::anyhow!("vevo step: {e}"))?
+            else {
+                break;
+            };
+            let dt = t0.elapsed().as_secs_f32();
+            hops += 1;
+            {
+                let mut st = stats.lock().unwrap();
+                st.rtf_vc = dt / hop_s;
+                // Warm-up grace like the other streaming engines: the
+                // first hops absorb one-off CUDA kernel/allocator costs.
                 if dt > hop_s && hops > 4 {
                     st.late += 1;
                 }
@@ -1493,6 +1656,20 @@ fn main() -> anyhow::Result<()> {
                 None,
             )
         }
+        EngineKind::Vevo => {
+            let vdev = xvc_device(args.cpu);
+            let veng = vevo::pipeline::VevoEngine::load(&ckpt, &vdev)
+                .map_err(|e| anyhow::anyhow!("cannot load the Vevo-Timbre engine: {e}"))?;
+            let ref_16k = read_wav_16k(&reference)?;
+            let ref_24k = vevo::pipeline::resample(&ref_16k, 16_000, 24_000);
+            (
+                Models::Vevo {
+                    engine: std::sync::Arc::new(veng),
+                    ref_24k,
+                },
+                None,
+            )
+        }
     };
 
     // Ctrl-C / SIGTERM funnels into the same shutdown path as `q`, so the
@@ -1582,6 +1759,7 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "seedvc")]
             EngineKind::SeedVc => read_wav_16k(path)?,
             EngineKind::CosyVoice => read_wav_16k(path)?,
+            EngineKind::Vevo => read_wav_16k(path)?,
         }),
     };
     let mic_input = wav_samples.is_none();
@@ -1867,6 +2045,7 @@ fn main() -> anyhow::Result<()> {
     let seedvc_cfm_steps = args.cfm_steps;
     let cosyvoice_context_s = args.cosyvoice_context_s;
     let cosyvoice_crossfade_ms = args.cosyvoice_crossfade_ms;
+    let vevo_steps = args.vevo_steps;
     // Window default per device (issue #42 knee search): CUDA absorbs
     // the official 2400 ms window (~4x fewer decoder needles, worst hop
     // ~43 ms vs the 240 ms deadline); CPU cannot and keeps 640 ms.
@@ -1918,6 +2097,19 @@ fn main() -> anyhow::Result<()> {
                     ref_16k,
                     cosyvoice_context_s,
                     cosyvoice_crossfade_ms,
+                    mic_input,
+                    rx_in,
+                    tx_out,
+                    stats_vc,
+                    run_vc,
+                    controls_vc,
+                );
+            }
+            Models::Vevo { engine, ref_24k } => {
+                return run_vevo_conversion(
+                    engine,
+                    ref_24k,
+                    vevo_steps,
                     mic_input,
                     rx_in,
                     tx_out,
