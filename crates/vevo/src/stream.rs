@@ -11,23 +11,47 @@
 //! Rates: `push` takes 16 kHz mic samples; `emit` returns 48 kHz
 //! output (Vocos synthesizes at 24 kHz internally, resampled up).
 //!
-//! ## Live status: not yet real-time on this port (candle CUDA)
+//! ## Live status: real-time as of the #77 depthwise-conv fix
 //!
-//! The #72 recon's "80 ms/block @ 6 steps" number was measured against
-//! the *official PyTorch* implementation — it does **not** carry over
-//! to this port. Per-hop profiling on an RTX 5090 (`cargo run
-//! --release -p vevo --features cuda --example stream_probe`) puts a
-//! 320 ms block at **~0.56 s wall time regardless of CFM step count**
-//! (2 vs 6 steps measured within noise of each other): content-style
-//! extraction ~70 ms, `reverse_diffusion` ~70 ms, **`Vocos::synthesize`
-//! ~420 ms** for the 30-layer/dim-1024 ConvNeXt backbone on ~40 mel
-//! frames. The CFM loop is *not* the bottleneck here (unlike Seed-VC's
-//! DiT), so lowering `steps` doesn't reclaim the deficit — the fix is
-//! in the vocoder path (candle's CUDA backend appears to pay a fixed
-//! per-kernel-launch cost across the 30-block ConvNeXt stack that
-//! PyTorch's cuDNN/fused path amortizes away). Tracked as a follow-up
-//! tuning item alongside #44/#48; offline `VevoEngine::inference_fm`
-//! is unaffected (no latency budget to miss).
+//! Originally **not** real-time: a 320 ms block cost ~0.56 s wall time
+//! on an RTX 5090, regardless of CFM step count. Root cause (issue
+//! [#77](https://github.com/m96-chan/babiniku.rs/issues/77)):
+//! `candle_core::Tensor::conv1d_with_algo`'s `groups > 1` path
+//! `chunk`s the input/kernel into `groups` pieces and issues one
+//! CUDA dispatch *per group* (`candle-core/src/conv.rs`) — no native
+//! grouped/depthwise kernel. `Vocos`'s ConvNeXt blocks are fully
+//! depthwise (`groups == dim == 1024`), so every block paid **1024
+//! tiny CUDA dispatches** for its one 7-tap conv — measured at ~14 ms/
+//! block × 30 blocks ≈ 420 ms, while every *other* op in a block
+//! (LayerNorm, both pointwise `Linear`s, GELU, the residual add)
+//! combined cost ~0.2 ms. Fixed in `vocos.rs` by replacing the
+//! `candle_nn::Conv1d` depthwise call with a hand-written
+//! shift-and-accumulate over the (7) kernel taps — O(kernel_size)
+//! whole-tensor broadcast ops instead of O(channels) tiny dispatches.
+//! Net: **0.56 s → 0.15 s per 320 ms block** (3.7x), golden parity
+//! unaffected (`cargo test -p vevo` still 12/12).
+//!
+//! That headroom funded a second fix
+//! ([#79](https://github.com/m96-chan/babiniku.rs/issues/79)): the
+//! original 0.5 s context was fast but left HuBERT/RepCodec/DiffLlama
+//! too little material to reliably resolve phoneme-level content
+//! (field report: "pitch tracks, content doesn't" — a genuine
+//! short-context quality ceiling, not a latency symptom). Sweeping
+//! context (`VEVO_CONTEXT_MS` env var on `stream_probe`) showed cost
+//! scales gently — 1.5 s: 0.16 s/block, 2 s: 0.17 s, 3 s: 0.18 s, 6 s:
+//! 0.22 s, all comfortably under the 320 ms budget — but a needle scan
+//! (`vc-core::declick::NeedleGuard` via `guard_wav`, same detector as
+//! the issue-#42 saga) on a fixed 26-hop/8.3 s clip found a real
+//! threshold: **0 events up to 1.5 s context, 6+ at 2.0 s and beyond**.
+//! Longer context isn't free — it reintroduces a small rate of
+//! needle-class pulses this port was otherwise clean of. Given #42's
+//! history, the default moved to a **conservative 1.5 s** (3x the
+//! original, zero new artifacts) rather than chasing more context at
+//! the cost of reopening needle risk; whether 1.5 s actually resolves
+//! #79's intelligibility gap is a field judgment call, not something
+//! provable from these metrics alone. If more context turns out to be
+//! necessary, wiring in `NeedleGuard` (already proven on X-VC) is the
+//! next lever, not further stretching context past this threshold.
 
 use candle_core::{Device, Tensor};
 
@@ -39,9 +63,11 @@ use crate::Result;
 pub struct StreamConfig {
     /// New input consumed per hop. 5_120 = 320 ms.
     pub block: usize,
-    /// Left context re-processed alongside each block. 8_000 = 0.5 s,
-    /// the window the #72 recon validated for content quality (see
-    /// the module docs for this port's actual measured latency).
+    /// Left context re-processed alongside each block. 24_000 = 1.5 s
+    /// — 3x the original 0.5 s (too short for reliable content per
+    /// #79), chosen as the largest context that stayed needle-clean in
+    /// a fixed-clip scan (see the module docs: needle-class pulses
+    /// start appearing at 2.0 s+).
     pub context: usize,
     /// Crossfade at block joins, in 24 kHz samples (~40 ms).
     pub crossfade_24k: usize,
@@ -51,8 +77,7 @@ pub struct StreamConfig {
     /// diffusion renders agree in envelope but not phase).
     pub sola_search_24k: usize,
     /// CFM steps. Offline default is 32; 6 keeps live quality close to
-    /// that while the vocoder path (not the CFM loop) is the actual
-    /// bottleneck on this port — see the module docs.
+    /// that with real budget headroom post-#77.
     pub steps: usize,
     /// Reference prompt cap in seconds — the prompt occupies the CFM
     /// sequence on every step of every hop.
@@ -63,7 +88,7 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             block: 5_120,
-            context: 8_000,
+            context: 24_000,
             crossfade_24k: 960,
             sola_search_24k: 240,
             steps: 6,

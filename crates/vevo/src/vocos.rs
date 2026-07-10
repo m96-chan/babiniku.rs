@@ -8,11 +8,62 @@
 //! meanvc copy, matching this workspace's per-engine-crate precedent.
 
 use candle_core::{Device, Module, Tensor};
-use candle_nn::{
-    conv1d, layer_norm, linear, Conv1d, Conv1dConfig, LayerNorm, LayerNormConfig, Linear,
-    VarBuilder,
-};
+use candle_nn::{conv1d, layer_norm, linear, Conv1d, Conv1dConfig, LayerNorm, LayerNormConfig, Linear, VarBuilder};
 use rustfft::{num_complex::Complex32, FftPlanner};
+
+/// Depthwise (`groups == in_channels`) 1D convolution, implemented as a
+/// shift-and-accumulate over the (small) kernel taps instead of via
+/// candle's generic `groups > 1` path.
+///
+/// **Why**: `candle_core::Tensor::conv1d_with_algo` handles `groups > 1`
+/// by `chunk`-ing the input/kernel into `groups` pieces and issuing one
+/// `conv1d_single_group` CUDA call per group, then `cat`-ing the
+/// results back together (`candle-core/src/conv.rs`) — no native
+/// grouped/depthwise kernel. For a fully depthwise conv (`groups ==
+/// dim == 1024` here), that's **1024 separate tiny CUDA dispatches per
+/// block**, measured at ~14 ms/block (30 blocks ⇒ ~420 ms, the entire
+/// #77 Vocos bottleneck — every other op in the block combined costs
+/// ~0.2 ms). This implementation instead does `kernel_size` (7)
+/// broadcast multiply-accumulates over the *whole* `[B, C, T]` tensor
+/// at once — O(kernel_size) dispatches instead of O(channels).
+struct DepthwiseConv1d {
+    /// `[channels, kernel_size]` (the PyTorch `[out, in/groups=1, k]`
+    /// weight with the redundant middle dim squeezed).
+    weight: Tensor,
+    bias: Tensor,
+    kernel_size: usize,
+    padding: usize,
+}
+
+impl DepthwiseConv1d {
+    fn load(channels: usize, kernel_size: usize, padding: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        let weight = vb.get((channels, 1, kernel_size), "weight")?.squeeze(1)?;
+        let bias = vb.get(channels, "bias")?;
+        Ok(Self {
+            weight,
+            bias,
+            kernel_size,
+            padding,
+        })
+    }
+
+    /// `x`: `[batch, channels, time]`.
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (_b, c, t) = x.dims3()?;
+        let xp = x.pad_with_zeros(2, self.padding, self.padding)?;
+        let mut acc: Option<Tensor> = None;
+        for k in 0..self.kernel_size {
+            let xk = xp.narrow(2, k, t)?; // [b, c, t]
+            let wk = self.weight.narrow(1, k, 1)?.reshape((1, c, 1))?; // [1, c, 1]
+            let term = xk.broadcast_mul(&wk)?;
+            acc = Some(match acc {
+                Some(a) => (a + term)?,
+                None => term,
+            });
+        }
+        acc.unwrap().broadcast_add(&self.bias.reshape((1, c, 1))?)
+    }
+}
 
 use vc_core::Result;
 
@@ -42,7 +93,7 @@ impl Default for VocosConfig {
 }
 
 struct ConvNeXtBlock {
-    dwconv: Conv1d,
+    dwconv: DepthwiseConv1d,
     norm: LayerNorm,
     pwconv1: Linear,
     pwconv2: Linear,
@@ -51,13 +102,8 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn new(dim: usize, intermediate_dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let conv_cfg = Conv1dConfig {
-            padding: 3,
-            groups: dim,
-            ..Default::default()
-        };
         Ok(Self {
-            dwconv: conv1d(dim, dim, 7, conv_cfg, vb.pp("dwconv"))?,
+            dwconv: DepthwiseConv1d::load(dim, 7, 3, vb.pp("dwconv"))?,
             norm: layer_norm(dim, LayerNormConfig::default(), vb.pp("norm"))?,
             pwconv1: linear(dim, intermediate_dim, vb.pp("pwconv1"))?,
             pwconv2: linear(intermediate_dim, dim, vb.pp("pwconv2"))?,
@@ -65,15 +111,29 @@ impl ConvNeXtBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward_profiled(&self, x: &Tensor, profile: bool) -> candle_core::Result<Tensor> {
+        let dev = x.device();
+        macro_rules! step {
+            ($label:expr, $e:expr) => {{
+                let t0 = std::time::Instant::now();
+                let r = $e;
+                if profile {
+                    dev.synchronize()?;
+                    eprintln!("    {}: {:.5}s", $label, t0.elapsed().as_secs_f32());
+                }
+                r
+            }};
+        }
         let residual = x;
-        let x = self.dwconv.forward(x)?.transpose(1, 2)?;
-        let x = self.norm.forward(&x)?;
-        let x = self
-            .pwconv2
-            .forward(&self.pwconv1.forward(&x)?.gelu_erf()?)?;
-        let x = x.broadcast_mul(&self.gamma)?.transpose(1, 2)?;
-        residual + x
+        let x = step!("dwconv", self.dwconv.forward(x))?;
+        let x = step!("transpose1", x.transpose(1, 2))?;
+        let x = step!("norm", self.norm.forward(&x))?;
+        let x = step!("pwconv1", self.pwconv1.forward(&x))?;
+        let x = step!("gelu", x.gelu_erf())?;
+        let x = step!("pwconv2", self.pwconv2.forward(&x))?;
+        let x = step!("gamma_mul", x.broadcast_mul(&self.gamma))?;
+        let x = step!("transpose2", x.transpose(1, 2))?;
+        step!("residual_add", residual + x)
     }
 }
 
@@ -142,13 +202,39 @@ impl Vocos {
     }
 
     fn spectrogram(&self, mel: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+        let profile = std::env::var("VEVO_VOCOS_PROFILE").is_ok();
+        let dev = mel.device();
+        let t0 = std::time::Instant::now();
         let x = self.embed.forward(mel)?;
         let x = self.norm.forward(&x.transpose(1, 2)?)?.transpose(1, 2)?;
-        let mut x = x;
-        for block in &self.blocks {
-            x = block.forward(&x)?;
+        if profile {
+            dev.synchronize()?;
+            eprintln!("  embed+norm: {:.4}s", t0.elapsed().as_secs_f32());
         }
+        let mut x = x;
+        let mut block_total = 0f32;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let tb = std::time::Instant::now();
+            x = block.forward_profiled(&x, profile && i == 0)?;
+            if profile {
+                dev.synchronize()?;
+                let dt = tb.elapsed().as_secs_f32();
+                block_total += dt;
+                if i == 0 || i == self.blocks.len() - 1 {
+                    eprintln!("  block[{i}]: {dt:.4}s");
+                }
+            }
+        }
+        if profile {
+            eprintln!("  blocks total ({} blocks): {:.4}s", self.blocks.len(), block_total);
+        }
+        let tf = std::time::Instant::now();
         let x = self.final_norm.forward(&x.transpose(1, 2)?)?;
+        if profile {
+            dev.synchronize()?;
+            eprintln!("  final_norm: {:.4}s", tf.elapsed().as_secs_f32());
+        }
+        let th = std::time::Instant::now();
         let x = self.out.forward(&x)?.transpose(1, 2)?; // [b, n_fft+2, t]
         let half = self.cfg.n_fft / 2 + 1;
         // `mag = exp(raw); mag = clip(mag, max=1e2)` — no pre-exp clamp,
@@ -157,6 +243,10 @@ impl Vocos {
         let phase = x.narrow(1, half, half)?;
         let real = mag.mul(&phase.cos()?)?;
         let imag = mag.mul(&phase.sin()?)?;
+        if profile {
+            dev.synchronize()?;
+            eprintln!("  head+trig: {:.4}s", th.elapsed().as_secs_f32());
+        }
         Ok((real, imag))
     }
 

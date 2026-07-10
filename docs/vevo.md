@@ -97,10 +97,10 @@ CFM's initial noise and both CFG-branch attention inputs/outputs
 alongside the usual per-stage tensors, so the DiffLlama/CFM tests are
 bit-reproducible, not just "close."
 
-## Streaming (live TUI) — not yet real-time
+## Streaming (live TUI) — real-time as of the #77/#79 fixes
 
 `VevoStream` follows the same shape as [`SeedVcStream`](seedvc.md): a
-sliding window (0.5 s context + 320 ms block) is re-processed through
+sliding window (1.5 s context + 320 ms block) is re-processed through
 the whole chain every hop and SOLA-spliced against the previous
 emission's held-back tail. Unlike Seed-VC there is **no
 length-regulation step** — content-style codes feed `cond_emb` directly,
@@ -108,31 +108,39 @@ frame-for-frame with the mel grid — so there's no separate
 "long-context-for-content, short-context-for-diffusion" split either;
 one window feeds HuBERT, RepCodec, and the CFM alike.
 
-**This port is not real-time on CUDA yet, and it is audible** (issue
-[#77](https://github.com/m96-chan/babiniku.rs/issues/77)) — confirmed
-by field report: live mic use produces clicking/popping, not just
-delayed audio, consistent with the conversion thread falling behind
-the input rate and `VevoStream`'s SOLA/crossfade splicing (which
-implicitly assumes a roughly-steady hop cadence) breaking down once
-hops overrun their budget. **Don't use `--engine vevo` for live/mic
-demos yet** — `VevoEngine::inference_fm` (offline, `--wav ... --out
-...`) has no latency budget to miss and stays golden-parity clean; use
-that instead until #77 closes.
+**This port was not real-time at first, and it was audible**: field
+report — live mic use produced clicking/popping, not just delayed
+audio. Root cause ([#77](https://github.com/m96-chan/babiniku.rs/issues/77)):
+`candle_core::Tensor::conv1d_with_algo`'s `groups > 1` path issues one
+CUDA dispatch **per group** (`chunk` → per-group `conv1d` → `cat`, no
+native grouped kernel). `Vocos`'s ConvNeXt blocks are fully depthwise
+(`groups == dim == 1024`), so every block paid **1024 tiny dispatches**
+for one 7-tap conv — ~14 ms/block × 30 blocks ≈ 420 ms of the ~560 ms
+total, while every other op in a block combined cost ~0.2 ms. Fixed by
+hand-writing the depthwise conv as a shift-and-accumulate over the 7
+kernel taps (`crates/vevo/src/vocos.rs::DepthwiseConv1d`) — O(kernel
+size) whole-tensor ops instead of O(channels) tiny dispatches. Net:
+**0.56 s → 0.15 s per 320 ms block** (3.7x), golden parity unaffected.
 
-A 320 ms block measured **~0.56 s wall time on an RTX 5090, regardless
-of CFM step count** (2 vs 6 steps land within noise of each other).
-Profiling
-isolated the cost: content-style extraction ~70 ms, `reverse_diffusion`
-~70 ms, **`Vocos::synthesize` ~420 ms** for the 30-layer/dim-1024
-ConvNeXt backbone on ~40 mel frames. The #72 recon's "80 ms/block"
-figure was measured against the *official PyTorch* implementation and
-does not carry over — candle's CUDA backend appears to pay a roughly
-fixed per-kernel-launch cost across the 30-block stack that PyTorch's
-cuDNN/fused kernels amortize away. `--vevo-steps` (default 6, mirrors
-Seed-VC's `--cfm-steps`) exists for tuning quality vs the CFM's own
-small compute cost, but won't close this gap — the fix is in the
-vocoder path, tracked in #77. `VevoEngine::inference_fm` (offline) has
-no latency budget to miss and is unaffected.
+That headroom funded the [#79](https://github.com/m96-chan/babiniku.rs/issues/79)
+fix: the original 0.5 s context was fast but too short for
+HuBERT/RepCodec/DiffLlama to reliably resolve content (field report:
+"pitch tracks, content doesn't" — a genuine short-context quality
+ceiling, distinct from #77's latency issue). A needle scan
+(`vc-core::declick::NeedleGuard`) across a context sweep found a real
+ceiling of its own: 0 events up to 1.5 s context, 6+ events at 2.0 s
+and beyond — longer context isn't free, it reintroduces needle-class
+pulses this port was otherwise clean of. Landed at **1.5 s** (3x the
+original, zero new artifacts) rather than chasing more context at the
+cost of reopening #42-class needle risk.
+
+Current measured cost (RTX 5090): **~0.16 s per 320 ms block, `late
+0`** through the full TUI pipeline (mic preprocessing, soft-gate
+expander included) — comfortable real-time headroom (~50 % of
+budget). `--vevo-steps` (default 6) still exists for quality/compute
+tuning but the CFM loop was never the bottleneck. `VevoEngine::
+inference_fm` (offline) remains unaffected either way — it never had a
+latency budget to miss.
 
 ## Usage
 
@@ -157,20 +165,23 @@ cargo run --release -p babiniku --features cuda --bin babiniku -- \
   `VevoEngine::inference_fm`'s `steps` argument).
 - Golden fixtures for development: `tools/gen_vevo_fixtures.py` (runs
   the official Amphion implementation — per CLAUDE.md it stays Python
-  by design). Debug/bench example: `stream_probe` (per-hop wall-time
-  breakdown, writes `ckpt/vevo_stream_demo.wav`).
+  by design). Debug/bench examples: `stream_probe` (per-hop wall-time
+  breakdown, writes `ckpt/vevo_stream_demo.wav`; `VEVO_CONTEXT_MS` /
+  `VEVO_STEPS` env vars override `StreamConfig` for tuning;
+  `VEVO_VOCOS_PROFILE=1` breaks the vocoder forward pass down
+  block-by-block), `offline_convert` (true whole-utterance
+  `inference_fm`, the path golden tests actually cover).
 
 ## Performance (RTX 5090, fp32)
 
 | mode | measured |
 |---|---|
 | offline (32 steps, ~3 s clip) | sub-second per stage; no latency budget |
-| streaming, 6 steps, 320 ms block | **~0.56 s/block — NOT real-time**, see #77 |
+| streaming, 6 steps, 1.5 s context, 320 ms block | **~0.16 s/block, `late 0`** — real-time, ~50 % of budget |
 | algorithmic latency | block 320 ms + SOLA/crossfade ~40 ms + output resample |
 
 CPU is far from real-time for this engine (comparable to Seed-VC's CPU
-class); `meanvc` remains the CPU baseline and `xvc`/`cosyvoice` the
-tuned-real-time CUDA alternatives until #77 closes the vocoder gap.
+class); `meanvc` remains the CPU baseline for engines without a GPU.
 
 ## Citation
 

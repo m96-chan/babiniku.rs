@@ -56,8 +56,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(StreamConfig::default().steps);
+    let context: usize = std::env::var("VEVO_CONTEXT_MS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|ms| ms * 16)
+        .unwrap_or(StreamConfig::default().context);
     let cfg = StreamConfig {
         steps,
+        context,
         ..StreamConfig::default()
     };
     let t0 = Instant::now();
@@ -67,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out: Vec<f32> = Vec::new();
     let mut fed = 0;
     let mut n = 0;
-    while fed + cfg.block <= src16.len() && n < 12 {
+    while fed + cfg.block <= src16.len() && n < 26 {
         stream.push(&src16[fed..fed + cfg.block]);
         fed += cfg.block;
         while stream.ready() {
