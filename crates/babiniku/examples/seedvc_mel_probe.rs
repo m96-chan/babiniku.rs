@@ -64,9 +64,10 @@ fn dump_mel(mel: &Tensor, path: &str) -> usize {
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 4 {
-        eprintln!("usage: seedvc_mel_probe <src.wav> <ref.wav> <ckpt-dir> <out-prefix>");
+        eprintln!("usage: seedvc_mel_probe <src.wav> <ref.wav> <ckpt-dir> <out-prefix> [steps]");
         std::process::exit(2);
     }
+    let steps: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
     let dev = Device::cuda_if_available(0).unwrap();
     let engine = SeedVcEngine::load(&a[2], &dev).unwrap();
 
@@ -97,7 +98,7 @@ fn main() {
     let noise = Tensor::randn(0f32, 1f32, (1, 80, t), &dev).unwrap();
 
     let vc_mel = engine
-        .cfm_inference(&cat, &mel_ref, &style, &noise, 10, 0.7)
+        .cfm_inference(&cat, &mel_ref, &style, &noise, steps, 0.7)
         .unwrap();
     // predicted mel for just the source (post-vocoder-input) region
     let pred_src_mel = vc_mel.narrow(2, t_ref, vc_mel.dim(2).unwrap() - t_ref).unwrap();
