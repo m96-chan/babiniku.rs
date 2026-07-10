@@ -108,10 +108,20 @@ frame-for-frame with the mel grid — so there's no separate
 "long-context-for-content, short-context-for-diffusion" split either;
 one window feeds HuBERT, RepCodec, and the CFM alike.
 
-**This port is not real-time on CUDA yet** (issue
-[#77](https://github.com/m96-chan/babiniku.rs/issues/77)): a 320 ms
-block measured **~0.56 s wall time on an RTX 5090, regardless of CFM
-step count** (2 vs 6 steps land within noise of each other). Profiling
+**This port is not real-time on CUDA yet, and it is audible** (issue
+[#77](https://github.com/m96-chan/babiniku.rs/issues/77)) — confirmed
+by field report: live mic use produces clicking/popping, not just
+delayed audio, consistent with the conversion thread falling behind
+the input rate and `VevoStream`'s SOLA/crossfade splicing (which
+implicitly assumes a roughly-steady hop cadence) breaking down once
+hops overrun their budget. **Don't use `--engine vevo` for live/mic
+demos yet** — `VevoEngine::inference_fm` (offline, `--wav ... --out
+...`) has no latency budget to miss and stays golden-parity clean; use
+that instead until #77 closes.
+
+A 320 ms block measured **~0.56 s wall time on an RTX 5090, regardless
+of CFM step count** (2 vs 6 steps land within noise of each other).
+Profiling
 isolated the cost: content-style extraction ~70 ms, `reverse_diffusion`
 ~70 ms, **`Vocos::synthesize` ~420 ms** for the 30-layer/dim-1024
 ConvNeXt backbone on ~40 mel frames. The #72 recon's "80 ms/block"

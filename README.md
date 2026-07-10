@@ -61,8 +61,9 @@ CPU via the pipelined driver, comfortably real-time on a GPU with a
 `--features cuda` build), `--engine cosyvoice` (Apache-2.0, needs a GPU
 for live mic — see [docs/cosyvoice.md](docs/cosyvoice.md)), `--engine
 vevo` (MIT/Apache-2.0 code with CC-BY-NC-4.0 weights, needle-clean like
-Seed-VC, needs a GPU for live mic and isn't real-time there yet — see
-[docs/vevo.md](docs/vevo.md)), or `--engine seedvc` (the most natural
+Seed-VC; **offline-only for now** — live mic audibly clicks/pops, not
+just lags, until [#77](https://github.com/m96-chan/babiniku.rs/issues/77)
+closes — see [docs/vevo.md](docs/vevo.md)), or `--engine seedvc` (the most natural
 voice by ear — needs a build with **`--features seedvc`**, which is
 **GPL-3.0 when distributed**, and a GPU; see
 [docs/seedvc.md](docs/seedvc.md)). The TUI shows the active engine and
@@ -84,7 +85,7 @@ its per-stage RTF.
 | [X-VC](docs/xvc.md) | ✅ working, official weights | Japanese-native quality; **live mic needs the CUDA build** (`--features cuda`, CUDA Toolkit at build time only — RTF ≈ 0.10 on GPU; CPU ≈ 0.9+ falls behind on a busy desktop) |
 | [Seed-VC](docs/seedvc.md) | ✅ working, official weights (**GPL-3.0, opt-in `seedvc` feature**) | Most natural by ear; 22.05 kHz BigVGAN line with **no decoder-needle pathology** (no declick stack needed); sliding-context streaming with SOLA joins, ~0.25 s/0.32 s block on GPU; adaptive voice-profile EQ toward the reference's real spectrum ([#49](https://github.com/m96-chan/babiniku.rs/issues/49)/[#50](https://github.com/m96-chan/babiniku.rs/issues/50)/[#62](https://github.com/m96-chan/babiniku.rs/issues/62)) |
 | [CosyVoice2](docs/cosyvoice.md) | ✅ working, official weights (**Apache-2.0, default build**) | LLM-bypassed VC path (24 kHz HiFT, needle-clean like Seed-VC); **live mic needs a GPU** (`--features cuda`/`metal`, CPU RTF 1.3+); sliding-window streaming with an 80 ms crossfade, RTF ≈ 0.27 on GPU ([#71](https://github.com/m96-chan/babiniku.rs/issues/71)/[#75](https://github.com/m96-chan/babiniku.rs/issues/75)) |
-| [Vevo-Timbre](docs/vevo.md) | ✅ working, official weights (**code MIT/Apache-2.0 default build, weights CC-BY-NC-4.0**) | HuBERT-large + DiffLlama CFM + Vocos, needle-clean like Seed-VC/CosyVoice2; on par with Seed-VC by ear; **live mic needs a GPU and is not yet real-time there** (~0.56 s/320 ms block, vocoder-bound — [#77](https://github.com/m96-chan/babiniku.rs/issues/77)) ([#72](https://github.com/m96-chan/babiniku.rs/issues/72)/[#74](https://github.com/m96-chan/babiniku.rs/issues/74)) |
+| [Vevo-Timbre](docs/vevo.md) | ⚠️ offline working (official weights, **code MIT/Apache-2.0 default build, weights CC-BY-NC-4.0**); **live mic not ready** | HuBERT-large + DiffLlama CFM + Vocos, needle-clean like Seed-VC/CosyVoice2; on par with Seed-VC by ear; **live mic audibly clicks/pops — not just slow** (~0.56 s/320 ms block, vocoder-bound; field-confirmed the RTF gap surfaces as real audio artifacts, not just delay — [#77](https://github.com/m96-chan/babiniku.rs/issues/77)); offline `--wav`/`inference_fm` is unaffected and golden-parity clean ([#72](https://github.com/m96-chan/babiniku.rs/issues/72)/[#74](https://github.com/m96-chan/babiniku.rs/issues/74)) |
 | [Zero-VC](docs/zero-vc.md) | 🔍 evaluation | zero-lookahead (20 ms algorithmic latency) — latency-first candidate; no public code yet ([#31](https://github.com/m96-chan/babiniku.rs/issues/31)) |
 
 Every engine is ported weight-compatible and verified stage-by-stage against its official implementation with golden tests (`cargo test --workspace`). Deep dive, APIs, checkpoint setup, performance notes: [docs/meanvc.md](docs/meanvc.md). Issues are labeled by architecture (`meanvc`, `meanvc2`, `xvc`, `seedvc`, `cosyvoice`, `vevo`, `tui`, `infra`).
