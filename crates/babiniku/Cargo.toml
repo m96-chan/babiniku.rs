@@ -12,6 +12,13 @@ publish = false
 name = "babiniku"
 path = "src/bin/babiniku.rs"
 
+# References the optional seedvc (GPL) dependency directly; without this,
+# `cargo test -p babiniku` (no --features seedvc) tries to build every
+# example and fails with an unresolved-crate error.
+[[example]]
+name = "vevo_vs_seedvc_similarity"
+required-features = ["seedvc"]
+
 [dependencies]
 # GPL-3.0 engine, strictly opt-in: binaries built WITHOUT the `seedvc`
 # feature carry no GPL obligations (see crates/seedvc/Cargo.toml).
