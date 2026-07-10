@@ -183,6 +183,41 @@ cargo run --release -p babiniku --features cuda --bin babiniku -- \
 CPU is far from real-time for this engine (comparable to Seed-VC's CPU
 class); `meanvc` remains the CPU baseline for engines without a GPU.
 
+## Reference-following is measurably weaker than Seed-VC's (field report, 2026-07)
+
+Field report: Vevo's output feels less strongly pulled toward the
+reference speaker than Seed-VC's on the same material. Quantified with
+`babiniku` example `vevo_vs_seedvc_similarity` (CosyVoice2's CAM++,
+independent of both engines under test, used purely as a similarity
+yardstick — same technique as `docs/cosyvoice.md`'s own
+speaker-similarity investigation):
+
+| pair | cosine similarity |
+|---|---|
+| source vs reference (baseline — how different the two speakers are) | 0.48 |
+| **Vevo** output vs reference | 0.82 |
+| **Seed-VC** output vs reference | 0.86 |
+
+Both engines pull the output far above the 0.48 baseline (conversion
+clearly works on both), but Seed-VC lands ~5% higher (relative). This
+is very likely **architectural, not a porting bug** — golden tests
+confirm bit-exact parity with the official implementation at every
+stage, and this measurement used `VevoEngine::inference_fm` directly
+(the whole reference, uncapped — the streaming `max_prompt_s` limit
+doesn't apply here). Seed-VC conditions on an explicit, discriminatively-
+trained CAM++ speaker embedding; **Vevo-Timbre has no speaker embedding
+at all** — timbre comes entirely from prompt-prefix in-context
+conditioning (the reference's own content-style codes and mel prepended
+to the sequence, letting the DiT "continue" in that voice). In-context
+conditioning is inherently a softer lock on identity than a purpose-
+trained global embedding pointed straight at the DiT.
+
+No fix attempted — this reflects the published model's design, not
+something a port should paper over. Worth knowing when picking an
+engine: Seed-VC for maximum identity fidelity, Vevo for its other
+tradeoffs (real-time-tuned CUDA cost, MIT/Apache-2.0 code with only the
+weights NC vs GPL, on-par-by-ear naturalness).
+
 ## Citation
 
 ```bibtex
