@@ -22,7 +22,7 @@ jobs:
     steps:
       # cargo refuses to clone from a shallow repository, so fetch full
       # history for the file:// install below.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
