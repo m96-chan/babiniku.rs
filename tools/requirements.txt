@@ -1,5 +1,5 @@
 torch>=2.1
-safetensors>=0.4
+safetensors>=0.8.0
 # per-component extras for the parity sweep (issue #8):
 # torchaudio  (mel fixture)
 # vocos       (Vocos golden outputs)
