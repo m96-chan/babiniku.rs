@@ -16,7 +16,7 @@ rustfft = { workspace = true }
 
 [dev-dependencies]
 hound = { workspace = true }
-safetensors = "0.4"
+safetensors = "0.8"
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
