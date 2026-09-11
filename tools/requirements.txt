@@ -1,4 +1,4 @@
-torch>=2.1
+torch>=2.14.0
 safetensors>=0.4
 # per-component extras for the parity sweep (issue #8):
 # torchaudio  (mel fixture)
